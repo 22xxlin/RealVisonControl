@@ -3,6 +3,11 @@
 视觉发布者 - 使用 ZeroMQ PUB 发布检测结果
 独立进程，替代原本的 VisionNode 线程
 
+【架构解耦 - 纯感知层】
+- 职责：只负责视觉感知，输出原始 Pattern 字符串（如 '2200', '110', 'IDLE'）
+- 不进行指令翻译：不再将 Pattern 转换为 'APPROACH', 'FORWARD' 等控制指令
+- 决策权交给 Control 端：由 control_sub.py 负责 Pattern -> Command 的映射
+
 架构：生产者-消费者模型（Producer-Consumer）
 - 生产者（4个子线程）：每个摄像头独立运行 camera_worker，读图、YOLO检测、灯语识别
   将检测数据通过线程安全队列 (queue.Queue) 发送给消费者
@@ -76,42 +81,45 @@ def calculate_distance_planar(detected_width, real_width, fx):
 class VisionPublisher:
     """视觉发布者 - 使用 ZeroMQ 发布检测结果"""
     
-    def __init__(self, model_path, camera_indices=[0, 2, 4, 6], zmq_port=5555):
+    def __init__(self, model_path, camera_indices=[0, 2, 4, 6], zmq_port=5555, debounce_threshold=5):
         """
         初始化视觉发布者
-        
+
         Args:
             model_path: YOLO 模型路径
             camera_indices: 摄像头索引列表
             zmq_port: ZeroMQ 发布端口
+            debounce_threshold: 去抖动阈值（连续确认帧数，默认5帧）
         """
         self.model_path = model_path
         self.camera_indices = camera_indices
         self.zmq_port = zmq_port
-        
+        self.debounce_threshold = debounce_threshold
+
         # 相机参数
         self.frame_width = 640
         self.frame_height = 480
         self.real_width = 0.31  # 目标真实宽度（米）
         self.camera_matrix = create_camera_matrix()
         self.camera_matrix_inv = np.linalg.inv(self.camera_matrix)
-        
-        # 灯语模式到动作的映射
-        self.PATTERN_TO_COMMAND = {
-            '220': 'FORWARD', '330': 'LEFT', '110': 'RIGHT', '550': 'REVERSE', '440': 'STOP',
-            '2200': 'APPROACH', '1100': 'RETREAT', '4400': 'S_SHAPE', '5500': 'CIRCLE',
-            '1111': 'FORWARD', '2222': 'LEFT', '3333': 'RIGHT', '4444': 'STOP', '5555': 'REVERSE',
-        }
-        
-        # 动作描述
-        self.ACTION_DESCRIPTIONS = {
-            'FORWARD': '前进', 'LEFT': '左移', 'RIGHT': '右移', 'STOP': '停止',
-            'REVERSE': '后退', 'APPROACH': '靠近', 'RETREAT': '远离', 
-            'S_SHAPE': 'S形', 'CIRCLE': '圆形', 'IDLE': '待机'
-        }
-        
+
+        # 【架构解耦】移除指令映射表
+        # 原本的 PATTERN_TO_COMMAND 和 ACTION_DESCRIPTIONS 已迁移到 control_sub.py
+        # Vision 端只负责输出原始 Pattern，不进行指令翻译
+
         # 临时检测缓存（用于灯语识别）
         self.detection_buffer = defaultdict(list)  # {cam_idx: []}
+
+        # 【去抖动机制】模式稳定性跟踪
+        # 结构: {(cam_idx, track_id): {'candidate': str, 'count': int, 'confirmed': str}}
+        # - candidate: 当前候选模式
+        # - count: 候选模式连续出现的次数
+        # - confirmed: 上一次确认的稳定模式（用于未达阈值时返回）
+        self.pattern_stability = defaultdict(lambda: {
+            'candidate': 'IDLE',
+            'count': 0,
+            'confirmed': 'IDLE'
+        })
 
         # 线程安全队列（生产者-消费者模型）
         self.queue = queue.Queue(maxsize=100)
@@ -122,6 +130,7 @@ class VisionPublisher:
         self.socket.bind(f"tcp://*:{self.zmq_port}")
 
         print(f"✅ 视觉发布者初始化完成 - ZMQ 绑定到 tcp://*:{self.zmq_port}")
+        print(f"🔧 去抖动阈值: {self.debounce_threshold} 帧")
 
     def initialize_camera(self, cam_idx):
         """初始化单个摄像头"""
@@ -152,40 +161,69 @@ class VisionPublisher:
 
     def recognize_pattern(self, cam_idx, track_id):
         """
-        简化的灯语识别
-        基于类别ID变化识别灯语模式
+        【架构解耦 - 纯感知层 + 去抖动机制】
+        灯语识别：基于类别ID变化识别灯语模式
+        返回：原始 Pattern 字符串（如 '2200', '110', 'IDLE'）
+        不再进行指令翻译，由 Control 端负责 Pattern -> Command 映射
+
+        【去抖动机制】：
+        - 使用滑动窗口计算原始模式 (raw_pattern)
+        - 通过连续帧确认机制过滤不稳定的过渡信号
+        - 只有当模式连续出现 >= debounce_threshold 帧时才确认输出
         """
         # 获取该 track_id 的最近检测
         recent_detections = [d for d in self.detection_buffer[cam_idx]
                            if d['track_id'] == track_id and time.time() - d['timestamp'] < 3.0]
 
         if len(recent_detections) < 10:
-            return 'IDLE'
-
-        # 统计类别ID
-        class_ids = [d['class_id'] for d in recent_detections[-36:]]  # 最近36帧
-
-        # 统计0和非0的比例
-        zero_count = sum(1 for cid in class_ids if cid == 0)
-        non_zero_count = len(class_ids) - zero_count
-
-        if non_zero_count == 0:
-            return 'IDLE'
-
-        non_zero_class = max(set([cid for cid in class_ids if cid != 0]),
-                           key=class_ids.count, default=0)
-
-        if zero_count == 0:
-            # 全是非零 -> xxxx 模式
-            pattern = f'{non_zero_class}{non_zero_class}{non_zero_class}{non_zero_class}'
-        elif non_zero_count / max(1, zero_count) > 1.8:
-            # 非零多 -> xx0 模式
-            pattern = f'{non_zero_class}{non_zero_class}0'
+            raw_pattern = 'IDLE'
         else:
-            # 比较均衡 -> xx00 模式
-            pattern = f'{non_zero_class}{non_zero_class}00'
+            # 统计类别ID
+            class_ids = [d['class_id'] for d in recent_detections[-36:]]  # 最近36帧
 
-        return self.PATTERN_TO_COMMAND.get(pattern, 'IDLE')
+            # 统计0和非0的比例
+            zero_count = sum(1 for cid in class_ids if cid == 0)
+            non_zero_count = len(class_ids) - zero_count
+
+            if non_zero_count == 0:
+                raw_pattern = 'IDLE'
+            else:
+                non_zero_class = max(set([cid for cid in class_ids if cid != 0]),
+                                   key=class_ids.count, default=0)
+
+                if zero_count == 0:
+                    # 全是非零 -> xxxx 模式
+                    raw_pattern = f'{non_zero_class}{non_zero_class}{non_zero_class}{non_zero_class}'
+                elif non_zero_count / max(1, zero_count) > 1.8:
+                    # 非零多 -> xx0 模式
+                    raw_pattern = f'{non_zero_class}{non_zero_class}0'
+                else:
+                    # 比较均衡 -> xx00 模式
+                    raw_pattern = f'{non_zero_class}{non_zero_class}00'
+
+        # ========== 【去抖动逻辑】 ==========
+        # 获取该目标的稳定性状态
+        key = (cam_idx, track_id)
+        stability = self.pattern_stability[key]
+
+        # 检查原始模式是否与当前候选一致
+        if raw_pattern == stability['candidate']:
+            # 一致：计数器 +1
+            stability['count'] += 1
+        else:
+            # 不一致：重置候选模式，计数器归1
+            stability['candidate'] = raw_pattern
+            stability['count'] = 1
+
+        # 判定是否达到确认阈值
+        if stability['count'] >= self.debounce_threshold:
+            # 达到阈值：确认该模式，更新 confirmed 状态
+            stability['confirmed'] = raw_pattern
+            return raw_pattern
+        else:
+            # 未达到阈值：返回上一次确认的稳定模式（避免闪烁）
+            # 这样可以保持输出稳定，直到新模式被充分确认
+            return stability['confirmed']
 
 
 
@@ -281,10 +319,11 @@ class VisionPublisher:
                             if len(self.detection_buffer[cam_idx]) > 200:
                                 self.detection_buffer[cam_idx] = self.detection_buffer[cam_idx][-200:]
 
-                            # 灯语识别
-                            command = self.recognize_pattern(cam_idx, track_id)
+                            # 【架构解耦】灯语识别：只输出原始 Pattern
+                            pattern = self.recognize_pattern(cam_idx, track_id)
 
-                            # 打包数据并放入队列（不直接发送）
+                            # 【关键变更】打包数据：发送 'pattern' 而非 'command'
+                            # 不再包含 'command' 和 'description' 字段
                             detection_data = {
                                 'type': 'detection',
                                 'distance': float(distance),
@@ -292,8 +331,7 @@ class VisionPublisher:
                                 'bearing_body': float(bearing_body),
                                 'track_id': int(track_id),
                                 'cam_idx': int(cam_idx),
-                                'command': command,
-                                'description': self.ACTION_DESCRIPTIONS.get(command, '未知'),
+                                'pattern': pattern,  # 原始 Pattern（如 '2200', '110', 'IDLE'）
                                 'class_id': int(class_id),
                                 'timestamp': time.time()
                             }
@@ -367,15 +405,15 @@ class VisionPublisher:
                     message = json.dumps(detection_data)
                     self.socket.send_string(f"{topic} {message}")
 
-                    # 简洁的终端日志
-                    cmd = detection_data.get('command', 'IDLE')
+                    # 【架构解耦】简洁的终端日志：显示原始 Pattern
+                    pattern = detection_data.get('pattern', 'IDLE')
                     dist = detection_data.get('distance', 0)
                     bearing = detection_data.get('bearing_body', 0)
                     track_id = detection_data.get('track_id', -1)
                     cam_idx = detection_data.get('cam_idx', -1)
 
-                    if cmd != 'IDLE':
-                        print(f"🎥 [Cam{cam_idx}] Sent: {cmd} | Dist={dist:.2f}m | Bearing={bearing:.1f}° | TrackID={track_id}")
+                    if pattern != 'IDLE':
+                        print(f"🎥 [Cam{cam_idx}] Sent Pattern: '{pattern}' | Dist={dist:.2f}m | Bearing={bearing:.1f}° | TrackID={track_id}")
 
                 # 标记任务完成
                 self.queue.task_done()
@@ -396,7 +434,7 @@ class VisionPublisher:
 
 if __name__ == "__main__":
     # 配置参数
-    MODEL_PATH = "/home/nvidia/Downloads/Ros/0821Car3/weights/best.engine"  # 修改为你的模型路径
+    MODEL_PATH = "/home/nvidia/Downloads/Ros/ballCar2/weights/weights/best.engine"  # 修改为你的模型路径
     CAMERA_INDICES = [0, 2, 4, 6]  # 4个摄像头并行工作：后、右、前、左
     ZMQ_PORT = 5555
 

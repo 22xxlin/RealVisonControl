@@ -1,304 +1,238 @@
-# vision_pub.py 重构前后对比
+# 架构解耦前后对比
 
-## 📊 架构对比
+## 📊 数据流对比
 
-### ❌ 重构前（单摄像头）
+### ❌ 解耦前（耦合架构）
 
 ```
-┌─────────────────────────────────┐
-│         主线程 (run)             │
-│                                 │
-│  直接调用 camera_worker(cam_idx) │
-│         ↓                       │
-│  while True:                    │
-│    - 读取图像                    │
-│    - YOLO 检测                  │
-│    - 灯语识别                    │
-│    - socket.send_string() ✅    │
-│    - print() ✅                 │
-│                                 │
-│  ⚠️ 主线程被占满，无法处理其他摄像头 │
-└─────────────────────────────────┘
+┌─────────────────────────────────────┐
+│         vision_pub.py               │
+│                                     │
+│  1. 摄像头采集                      │
+│  2. YOLO 检测                       │
+│  3. 灯语识别 -> Pattern '2200'     │
+│  4. 翻译指令 -> Command 'APPROACH' │ ⚠️ 职责过多
+│  5. 发送 {'command': 'APPROACH'}   │
+└──────────────┬──────────────────────┘
+               │
+               ├─────────────────┬─────────────────┐
+               ↓                 ↓                 ↓
+    ┌──────────────────┐  ┌──────────────┐  ┌──────────────┐
+    │ control_sub.py   │  │test_vision_  │  │ 其他订阅者   │
+    │                  │  │pub.py        │  │              │
+    │ 接收 'APPROACH'  │  │接收 'APPROACH'│  │接收 'APPROACH'│
+    │ 执行控制         │  │显示日志      │  │处理数据      │
+    └──────────────────┘  └──────────────┘  └──────────────┘
 ```
 
-**问题：**
-- ❌ 只支持单摄像头
-- ❌ 主线程被 camera_worker 占满
-- ❌ 无法并行处理多个摄像头
-- ❌ 扩展性差
+**问题**：
+- ❌ Vision 端承担了"感知"和"决策"两个职责
+- ❌ 修改映射表需要重启 Vision 端（影响所有摄像头）
+- ❌ 无法独立测试感知和决策模块
+- ❌ 耦合度高，扩展性差
 
 ---
 
-### ✅ 重构后（4摄像头并行）
+### ✅ 解耦后（分层架构）
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    主线程 (消费者)                        │
-│  1. 启动 4 个生产者线程                                   │
-│  2. while True:                                         │
-│       data = queue.get()  ← 从队列取数据                 │
-│       socket.send_string() ✅  ← 主线程统一发送           │
-│       print() ✅  ← 主线程统一打印                        │
-└─────────────────────────────────────────────────────────┘
-                           ↑
-                           │ queue.get()
-                           │
-              ┌────────────┴────────────┐
-              │  queue.Queue(maxsize=100) │
-              │    (线程安全队列)          │
-              └────────────┬────────────┘
-                           │ queue.put_nowait()
-                           ↓
-┌──────────────┬──────────────┬──────────────┬──────────────┐
-│  生产者线程1  │  生产者线程2  │  生产者线程3  │  生产者线程4  │
-│  Camera 0    │  Camera 2    │  Camera 4    │  Camera 6    │
-│  (后方)      │  (右侧)      │  (前方)      │  (左侧)      │
-│              │              │              │              │
-│  while True: │  while True: │  while True: │  while True: │
-│  - 读图      │  - 读图      │  - 读图      │  - 读图      │
-│  - YOLO      │  - YOLO      │  - YOLO      │  - YOLO      │
-│  - 灯语      │  - 灯语      │  - 灯语      │  - 灯语      │
-│  - 放队列 ✅  │  - 放队列 ✅  │  - 放队列 ✅  │  - 放队列 ✅  │
-└──────────────┴──────────────┴──────────────┴──────────────┘
+┌─────────────────────────────────────┐
+│         vision_pub.py               │  ✅ 纯感知层
+│                                     │
+│  1. 摄像头采集                      │
+│  2. YOLO 检测                       │
+│  3. 灯语识别 -> Pattern '2200'     │
+│  4. 发送 {'pattern': '2200'}       │  ✅ 只负责感知
+└──────────────┬──────────────────────┘
+               │ 原始 Pattern
+               ├─────────────────┬─────────────────┐
+               ↓                 ↓                 ↓
+    ┌──────────────────┐  ┌──────────────┐  ┌──────────────┐
+    │ control_sub.py   │  │test_vision_  │  │ 其他订阅者   │
+    │                  │  │pub.py        │  │              │
+    │ 接收 '2200'      │  │接收 '2200'   │  │接收 '2200'   │
+    │ 翻译 'APPROACH'  │  │显示 Pattern  │  │自定义处理    │
+    │ 执行控制         │  │              │  │              │
+    └──────────────────┘  └──────────────┘  └──────────────┘
+         ↑ 决策层
 ```
 
-**优势：**
-- ✅ 支持 4 个摄像头并行
-- ✅ 主线程专注于消费和发送
-- ✅ 生产者线程独立工作
-- ✅ 线程安全，易于扩展
+**优势**：
+- ✅ Vision 端只负责感知，职责单一
+- ✅ Control 端负责决策，可独立修改映射表
+- ✅ 可独立测试各模块
+- ✅ 解耦清晰，扩展性强
 
 ---
 
-## 🔧 代码对比
+## 📝 代码对比
 
-### 1. 导入模块
+### vision_pub.py
 
-#### ❌ 重构前
+#### ❌ 解耦前
 ```python
-import cv2
-import numpy as np
-import time
-import math
-import json
-import zmq
-from collections import defaultdict
-from ultralytics import YOLO
+# 第 100-112 行：包含映射表
+self.PATTERN_TO_COMMAND = {
+    '220': 'FORWARD', '2200': 'APPROACH', ...
+}
+self.ACTION_DESCRIPTIONS = {
+    'FORWARD': '前进', 'APPROACH': '靠近', ...
+}
+
+# 第 188 行：翻译指令
+return self.PATTERN_TO_COMMAND.get(pattern, 'IDLE')
+
+# 第 288-299 行：发送 Command
+detection_data = {
+    'command': command,           # 已翻译的指令
+    'description': '靠近',        # 中文描述
+    ...
+}
 ```
 
-#### ✅ 重构后
+#### ✅ 解耦后
 ```python
-import cv2
-import numpy as np
-import time
-import math
-import json
-import zmq
-import queue       # ← 新增
-import threading   # ← 新增
-from collections import defaultdict
-from ultralytics import YOLO
-```
+# 第 104-106 行：移除映射表
+# 【架构解耦】移除指令映射表
+# Vision 端只负责输出原始 Pattern
 
----
+# 第 185-186 行：返回原始 Pattern
+return pattern  # 直接返回 '2200'
 
-### 2. 初始化
-
-#### ❌ 重构前
-```python
-def __init__(self, model_path, camera_indices=[0, 2, 4, 6], zmq_port=5555):
-    # ...
-    self.detection_buffer = defaultdict(list)
-    
-    # 初始化 ZeroMQ
-    self.context = zmq.Context()
-    self.socket = self.context.socket(zmq.PUB)
-    self.socket.bind(f"tcp://*:{self.zmq_port}")
-```
-
-#### ✅ 重构后
-```python
-def __init__(self, model_path, camera_indices=[0, 2, 4, 6], zmq_port=5555):
-    # ...
-    self.detection_buffer = defaultdict(list)
-    
-    # 线程安全队列（生产者-消费者模型）← 新增
-    self.queue = queue.Queue(maxsize=100)
-    
-    # 初始化 ZeroMQ
-    self.context = zmq.Context()
-    self.socket = self.context.socket(zmq.PUB)
-    self.socket.bind(f"tcp://*:{self.zmq_port}")
+# 第 282-297 行：发送 Pattern
+detection_data = {
+    'pattern': pattern,           # 原始 Pattern
+    ...                           # 移除 command 和 description
+}
 ```
 
 ---
 
-### 3. camera_worker 方法
+### control_sub.py
 
-#### ❌ 重构前（直接发送）
+#### ❌ 解耦前
 ```python
-def camera_worker(self, cam_idx):
-    # ...
-    while True:
-        # 检测逻辑
-        detection_data = {
-            'distance': float(distance),
-            'bearing_body': float(bearing_body),
-            # ...
-        }
-        
-        # ❌ 直接在子线程中发送 ZMQ（不安全）
-        self.publish_detection(detection_data)
+# 第 344 行：直接使用 Vision 端的翻译结果
+command = data.get('command', 'IDLE')
 
-def publish_detection(self, data):
-    # ❌ 直接操作 socket（不安全）
-    self.socket.send_string(f"perception {json.dumps(data)}")
-    # ❌ 直接打印（多线程日志混乱）
-    print(f"🎥 [Cam{cam_idx}] Sent: ...")
+# 第 353-367 行：执行控制
+if command == 'APPROACH':
+    self.execute_approach_step(target_info)
+elif command == 'RETREAT':
+    self.execute_retreat_step(target_info)
+...
 ```
 
-#### ✅ 重构后（放入队列）
+#### ✅ 解耦后
 ```python
-def camera_worker(self, cam_idx):
-    # ...
-    while True:
-        # 检测逻辑
-        detection_data = {
-            'type': 'detection',  # ← 新增类型字段
-            'distance': float(distance),
-            'bearing_body': float(bearing_body),
-            # ...
-        }
-        
-        # ✅ 放入队列，不直接发送
-        try:
-            self.queue.put_nowait(detection_data)
-        except queue.Full:
-            pass  # 队列满了，丢弃该帧
+# 第 52-80 行：添加映射表
+self.PATTERN_TO_COMMAND = {
+    '220': 'FORWARD', '2200': 'APPROACH', ...
+}
+self.ACTION_DESCRIPTIONS = {
+    'FORWARD': '前进', 'APPROACH': '靠近', ...
+}
 
-# ✅ 删除了 publish_detection 方法
+# 第 348-363 行：翻译并执行
+pattern = data.get('pattern', 'IDLE')  # 提取 Pattern
+command = self.PATTERN_TO_COMMAND.get(pattern, 'IDLE')  # 翻译
+
+# 决策日志
+if command != 'IDLE':
+    print(f"🧠 Decision: Pattern '{pattern}' -> Action '{command}'")
+
+# 执行控制
+if command == 'APPROACH':
+    self.execute_approach_step(target_info)
+...
 ```
 
 ---
 
-### 4. run 方法
+### test_vision_pub.py
 
-#### ❌ 重构前（单摄像头）
+#### ❌ 解耦前
 ```python
-def run(self):
-    """运行视觉发布者（单摄像头模式）"""
-    if len(self.camera_indices) == 1:
-        # ❌ 直接调用，主线程被占满
-        self.camera_worker(self.camera_indices[0])
-    else:
-        print("⚠️ 多摄像头模式需要使用多进程，当前仅支持单摄像头")
+# 第 48-56 行
+cmd = data.get('command', 'IDLE')
+if cmd != 'IDLE':
+    print(f"📥 [Cam{cam_idx}] Received: {cmd} | ...")
 ```
 
-#### ✅ 重构后（多摄像头并行）
+#### ✅ 解耦后
 ```python
-def run(self):
-    """运行视觉发布者（多摄像头并行模式）"""
-    # ✅ 启动所有摄像头的生产者线程
-    threads = []
-    for cam_idx in self.camera_indices:
-        thread = threading.Thread(
-            target=self.camera_worker,
-            args=(cam_idx,),
-            daemon=True,
-            name=f"Camera-{cam_idx}"
-        )
-        thread.start()
-        threads.append(thread)
-    
-    # ✅ 主线程作为消费者，不断从队列取数据
-    try:
-        while True:
-            data = self.queue.get()
-            
-            if data.get('type') == 'log':
-                print(data['message'])
-            
-            elif data.get('type') == 'detection':
-                # ✅ 主线程统一发送 ZMQ
-                detection_data = {k: v for k, v in data.items() if k != 'type'}
-                message = json.dumps(detection_data)
-                self.socket.send_string(f"perception {message}")
-                
-                # ✅ 主线程统一打印日志
-                if detection_data['command'] != 'IDLE':
-                    print(f"🎥 [Cam{cam_idx}] Sent: ...")
-            
-            self.queue.task_done()
-    
-    except KeyboardInterrupt:
-        for thread in threads:
-            thread.join(timeout=5.0)
+# 第 53-61 行
+pattern = data.get('pattern', 'IDLE')
+if pattern != 'IDLE':
+    print(f"📥 [Cam{cam_idx}] Received Pattern: '{pattern}' | ...")
 ```
 
 ---
 
-## 📈 性能对比
+## 🎯 日志输出对比
 
-| 指标 | 重构前 | 重构后 |
+### ❌ 解耦前
+
+**Vision 端**：
+```
+🎥 [Cam4] Sent: APPROACH | Dist=1.50m | Bearing=45.0° | TrackID=3
+```
+
+**Control 端**：
+```
+➡️ APPROACH: 误差1.00m | 方向45.0° | vx=0.289, vy=0.289
+```
+
+**test_vision_pub.py**：
+```
+📥 [Cam4] Received: APPROACH | Dist=1.50m | Bearing=45.0° | TrackID=3
+```
+
+---
+
+### ✅ 解耦后
+
+**Vision 端**：
+```
+🎥 [Cam4] Sent Pattern: '2200' | Dist=1.50m | Bearing=45.0° | TrackID=3
+```
+
+**Control 端**：
+```
+🧠 Decision: Pattern '2200' -> Action 'APPROACH' (靠近)
+➡️ APPROACH: 误差1.00m | 方向45.0° | vx=0.289, vy=0.289
+```
+
+**test_vision_pub.py**：
+```
+📥 [Cam4] Received Pattern: '2200' | Dist=1.50m | Bearing=45.0° | TrackID=3
+```
+
+---
+
+## 📊 性能对比
+
+| 指标 | 解耦前 | 解耦后 | 说明 |
+|------|--------|--------|------|
+| Vision 端 CPU | 高 | 低 | 移除了映射表查询 |
+| Control 端 CPU | 低 | 略高 | 增加了映射表查询 |
+| 总体性能 | 相同 | 相同 | 只是职责转移 |
+| 可维护性 | 低 | 高 | 职责清晰 |
+| 可扩展性 | 低 | 高 | 易于修改映射 |
+| 可测试性 | 低 | 高 | 可独立测试 |
+
+---
+
+## ✅ 总结
+
+| 方面 | 解耦前 | 解耦后 |
 |------|--------|--------|
-| 支持摄像头数 | 1 | 4 |
-| 并行处理 | ❌ | ✅ |
-| 线程安全 | ⚠️ | ✅ |
-| ZMQ 发送 | 子线程（不安全） | 主线程（安全） |
-| 日志打印 | 多线程混乱 | 主线程统一 |
-| 队列缓冲 | ❌ | ✅ (100) |
-| 丢帧策略 | ❌ | ✅ |
-| 扩展性 | 差 | 好 |
+| **职责划分** | ❌ 混乱 | ✅ 清晰 |
+| **数据格式** | `{'command': 'APPROACH'}` | `{'pattern': '2200'}` |
+| **决策位置** | Vision 端 | Control 端 |
+| **可维护性** | ❌ 低 | ✅ 高 |
+| **可扩展性** | ❌ 低 | ✅ 高 |
+| **可测试性** | ❌ 低 | ✅ 高 |
 
----
-
-## 🎯 关键改进点
-
-### 1. 线程安全
-- **重构前**: 多个线程直接操作 ZMQ Socket（不安全）
-- **重构后**: 只有主线程操作 Socket（安全）
-
-### 2. 并行能力
-- **重构前**: 单摄像头，串行处理
-- **重构后**: 4摄像头，并行处理
-
-### 3. 解耦设计
-- **重构前**: camera_worker 负责检测 + 发送 + 打印
-- **重构后**: camera_worker 只负责检测，主线程负责发送和打印
-
-### 4. 队列缓冲
-- **重构前**: 无缓冲，直接发送
-- **重构后**: 100个消息的缓冲区，平滑突发流量
-
-### 5. 丢帧策略
-- **重构前**: 无丢帧机制
-- **重构后**: 队列满时自动丢弃，保证实时性
-
----
-
-## 🚀 迁移指南
-
-如果你有旧版本的代码，只需要：
-
-1. **更新 CAMERA_INDICES**
-   ```python
-   # 旧版本
-   CAMERA_INDICES = [4]  # 单摄像头
-   
-   # 新版本
-   CAMERA_INDICES = [0, 2, 4, 6]  # 4摄像头
-   ```
-
-2. **运行新版本**
-   ```bash
-   python3 vision_pub.py
-   ```
-
-3. **无需修改订阅者代码**
-   - ZMQ 消息格式保持不变
-   - 订阅者无需任何修改
-
----
-
-**重构完成！** 🎉 现在可以享受 4 摄像头并行处理的强大能力了！
+**结论**：架构解耦成功，系统更加清晰、灵活、易维护！
 

@@ -2,6 +2,12 @@
 """
 控制订阅者 - 使用 ZeroMQ SUB 接收检测结果并执行控制
 独立进程，替代原本的 ControlNode 线程
+
+【架构解耦 - 决策层】
+- 职责：负责"大脑决策"，将原始 Pattern 翻译成具体控制指令
+- 接收 Vision 端发送的原始 Pattern（如 '2200', '110', 'IDLE'）
+- 使用内部映射表 PATTERN_TO_COMMAND 进行决策
+- 执行对应的运动控制函数
 """
 
 import os
@@ -30,7 +36,7 @@ class ControlSubscriber:
     def __init__(self, robot_id=8, enable_control=True, zmq_address="tcp://localhost:5555", timeout_ms=1000):
         """
         初始化控制订阅者
-        
+
         Args:
             robot_id: 机器人ID
             enable_control: 是否启用实际控制
@@ -41,6 +47,37 @@ class ControlSubscriber:
         self.enable_control = enable_control and ROBOT_CONTROL_AVAILABLE
         self.zmq_address = zmq_address
         self.timeout_ms = timeout_ms
+
+        # 【架构解耦 - 决策层】Pattern 到 Command 的映射表
+        # 从 vision_pub.py 迁移过来，由 Control 端负责决策
+        self.PATTERN_TO_COMMAND = {
+            # 基本运动模式（3位）
+            '220': 'FORWARD',   # 红红黑 -> 前进
+            '330': 'LEFT',      # 绿绿黑 -> 左移
+            '110': 'RIGHT',     # 蓝蓝黑 -> 右移
+            '550': 'REVERSE',   # 黄黄黑 -> 后退
+            '440': 'STOP',      # 紫紫黑 -> 停止
+
+            # 高级运动模式（4位）
+            '2200': 'APPROACH', # 红红黑黑 -> 靠近
+            '1100': 'RETREAT',  # 蓝蓝黑黑 -> 远离
+            '4400': 'S_SHAPE',  # 紫紫黑黑 -> S形轨迹
+            '5500': 'CIRCLE',   # 黄黄黑黑 -> 圆形轨迹
+
+            # 连续模式（4位）
+            '1111': 'FORWARD',  # 蓝蓝蓝蓝 -> 前进
+            '2222': 'LEFT',     # 红红红红 -> 左移
+            '3333': 'RIGHT',    # 绿绿绿绿 -> 右移
+            '4444': 'STOP',     # 紫紫紫紫 -> 停止
+            '5555': 'REVERSE',  # 黄黄黄黄 -> 后退
+        }
+
+        # 动作描述（用于日志输出）
+        self.ACTION_DESCRIPTIONS = {
+            'FORWARD': '前进', 'LEFT': '左移', 'RIGHT': '右移', 'STOP': '停止',
+            'REVERSE': '后退', 'APPROACH': '靠近', 'RETREAT': '远离',
+            'S_SHAPE': 'S形', 'CIRCLE': '圆形', 'IDLE': '待机'
+        }
         
         # 初始化机器人控制器
         self.robot_controller = None
@@ -283,10 +320,15 @@ class ControlSubscriber:
             return False
 
     def run(self):
-        """运行控制订阅者主循环"""
+        """
+        【架构解耦 - 决策层】运行控制订阅者主循环
+        接收原始 Pattern，翻译成 Command，执行控制
+        """
         print(f"🚀 启动控制订阅者")
         print(f"📡 订阅地址: {self.zmq_address}")
-        print(f"⏱️ 超时保护: {self.timeout_ms}ms\n")
+        print(f"⏱️ 超时保护: {self.timeout_ms}ms")
+        print(f"🧠 决策模式: Pattern -> Command 映射")
+        print(f"📋 支持的 Pattern: {list(self.PATTERN_TO_COMMAND.keys())}\n")
 
         try:
             while True:
@@ -303,14 +345,22 @@ class ControlSubscriber:
                     topic, json_data = parts
                     data = json.loads(json_data)
 
-                    # 提取信息
-                    command = data.get('command', 'IDLE')
+                    # 【关键变更】提取原始 Pattern（而非 command）
+                    pattern = data.get('pattern', 'IDLE')
                     target_info = {
                         'distance': data.get('distance', 0),
                         'bearing_body': data.get('bearing_body', 0),
                         'track_id': data.get('track_id', -1),
                         'cam_idx': data.get('cam_idx', -1)
                     }
+
+                    # 【架构解耦 - 决策层】Pattern -> Command 翻译
+                    command = self.PATTERN_TO_COMMAND.get(pattern, 'IDLE')
+
+                    # 决策日志
+                    if command != 'IDLE':
+                        description = self.ACTION_DESCRIPTIONS.get(command, '未知')
+                        print(f"🧠 Decision: Pattern '{pattern}' -> Action '{command}' ({description})")
 
                     # 执行控制逻辑
                     if command == 'APPROACH':

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
 测试脚本：演示 vision_pub.py 的多摄像头并行架构
+
+【架构解耦后更新】
+- 现在接收的是原始 Pattern（如 '2200', '110'）而非 Command
+- 兼容新的数据格式：{'pattern': '2200', ...}
 """
 
 import time
@@ -43,15 +47,16 @@ def zmq_subscriber(port=5555, duration=10):
                     cam_idx = data.get('cam_idx', -1)
                     if cam_idx in cam_stats:
                         cam_stats[cam_idx] += 1
-                    
-                    # 打印检测信息
-                    cmd = data.get('command', 'IDLE')
+
+                    # 【架构解耦后更新】打印检测信息
+                    # 现在接收的是 'pattern' 而非 'command'
+                    pattern = data.get('pattern', 'IDLE')
                     dist = data.get('distance', 0)
                     bearing = data.get('bearing_body', 0)
                     track_id = data.get('track_id', -1)
-                    
-                    if cmd != 'IDLE':
-                        print(f"📥 [Cam{cam_idx}] Received: {cmd} | "
+
+                    if pattern != 'IDLE':
+                        print(f"📥 [Cam{cam_idx}] Received Pattern: '{pattern}' | "
                               f"Dist={dist:.2f}m | Bearing={bearing:.1f}° | "
                               f"TrackID={track_id}")
             
