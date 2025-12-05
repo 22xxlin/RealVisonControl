@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyCharm
+.idea/
+
+# Model files (通常很大，不建议上传)
+*.engine
+*.pt
+*.pth
+*.onnx
+*.weights
+weights/
+
+# Log files
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+
+# Video and image files (如果有测试视频/图片)
+*.mp4
+*.avi
+*.jpg
+*.jpeg
+*.png
+*.gif
+
+# 如果有数据文件夹
+data/
+dataset/
+
