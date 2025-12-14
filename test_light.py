@@ -1,65 +1,103 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-文件: test_light.py
-功能: 单独测试 LightDriver 的状态切换和 MQTT 发送
+文件: test_light_vision.py
+功能: 手动控制灯光，用于验证 vision_pub.py 的识别效果
+用法: 
+  1. 运行此脚本控制灯光切换
+  2. 在另一个终端运行 vision_pub.py 查看识别结果
 """
 
-import time
 import sys
-# 确保导入你刚才保存的驱动文件
+import time
+import threading
+
 try:
     from light_driver import LightDriver
 except ImportError:
-    print("❌ 找不到 light_driver.py，请确保它在同一目录下！")
+    print("❌ 错误: 找不到 light_driver.py")
     sys.exit(1)
 
+# === 测试菜单定义 ===
+# 格式: (指令Key, 描述, 预期视觉输出)
+TEST_MENU = [
+    ("OFF",           "⚫ 关闭",                   "Class 0 (OFF)"),
+    ("SEARCH",        "🟣 紫色闪烁 (搜索)",         "Class 4 (PURPLE) - FLASH"),
+    ("APPROACH_BALL", "🔴 红色闪烁 (靠近球)",       "Class 2 (RED)    - FLASH"),
+    ("LEADER_WAIT",   "🔴 红色常亮 (Leader锚点)",   "Class 2 (RED)    - SOLID"),
+    ("BID_LEFT",      "🟢 绿色闪烁 (抢左槽)",       "Class 3 (GREEN)  - FLASH"),
+    ("LOCK_LEFT",     "🟢 绿色常亮 (左就位)",       "Class 3 (GREEN)  - SOLID"),
+    ("BID_RIGHT",     "🔵 蓝色闪烁 (抢右槽)",       "Class 1 (BLUE)   - FLASH"),
+    ("LOCK_RIGHT",    "🔵 蓝色常亮 (右就位)",       "Class 1 (BLUE)   - SOLID"),
+    ("LEADER_GO",     "🟣 紫色常亮 (Leader搬运)",   "Class 4 (PURPLE) - SOLID"),
+    ("FOLLOWER_PUSH", "⚪ 灰色常亮 (Follower搬运)", "Class 5 (GRAY)   - SOLID"),
+]
+
+def print_menu():
+    print("\n" + "="*50)
+    print("🚦 灯光与视觉联合测试工具")
+    print("="*50)
+    for i, (key, desc, expect) in enumerate(TEST_MENU):
+        print(f"[{i}] {desc:<20} -> 👁️ 预期: {expect}")
+    print("[a] 自动循环测试 (每5秒切一次)")
+    print("[q] 退出并熄灯")
+    print("="*50)
+
+def auto_cycle(driver):
+    print("\n🔄 开始自动循环测试 (按 Ctrl+C 停止)...")
+    try:
+        while True:
+            for key, desc, expect in TEST_MENU:
+                if key == "OFF": continue
+                print(f"\n👉 正在执行: {desc}")
+                print(f"👁️ 请检查视觉端是否输出: {expect}")
+                driver.set_cmd(key)
+                
+                # 倒计时
+                for k in range(5, 0, -1):
+                    print(f"   保持 {k}s...", end="\r")
+                    time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n⏸️ 自动循环停止")
+
 def main():
-    # 配置
-    ROBOT_ID = 15
-    BROKER_IP = "10.0.2.66"  # 如果是本机测试，改成 "localhost"
-    
-    print(f"🚀 开始测试 LightDriver (ID: {ROBOT_ID}, IP: {BROKER_IP})")
-    print("按 Ctrl+C 强行中止")
+    # 1. 初始化驱动
+    robot_id = 15 # 测试用的默认ID
+    print(f"正在连接 MQTT (Robot ID: {robot_id})...")
     
     try:
-        # 1. 初始化驱动
-        driver = LightDriver(robot_id=ROBOT_ID, broker_ip=BROKER_IP)
-        time.sleep(1) # 等待 MQTT 连接建立
-
-        # 2. 测试循环
-        # 测试序列：(指令名称, 预期效果, 持续时间)
-        test_sequence = [
-            ("SEARCH",  "🟣 搜索状态 (紫色闪烁)", 5),
-            ("FOUND",   "🔵 发现状态 (蓝色闪烁)", 5),
-            ("ARRIVED", "🟢 到达状态 (绿色常亮)", 5),
-            ("IDLE",    "⚪ 待机状态 (灰色闪烁)", 5),
-            ("OFF",     "⚫ 关闭 (熄灭)", 3)
-        ]
-
-        for cmd, desc, duration in test_sequence:
-            print(f"\n👉 发送指令: {cmd} -> {desc}")
-            driver.set_cmd(cmd)
-            
-            # 倒计时显示
-            for i in range(duration, 0, -1):
-                print(f"   保持 {i} 秒...", end="\r")
-                time.sleep(1)
-            print("   完成!            ")
-
-        print("\n✅ 测试序列结束")
-        driver.stop()
-
-    except KeyboardInterrupt:
-        print("\n🛑 用户中止")
-        driver.stop()
+        driver = LightDriver(robot_id, broker_ip="10.0.2.66")
+        time.sleep(1) # 等待连接
     except Exception as e:
-        print(f"\n❌ 发生错误: {e}")
-        # 尝试安全停止
-        try:
+        print(f"❌ 驱动启动失败: {e}")
+        return
+
+    # 2. 交互循环
+    while True:
+        print_menu()
+        user_input = input("请输入指令序号: ").strip().lower()
+
+        if user_input == 'q':
+            print("👋 退出中...")
             driver.stop()
-        except:
-            pass
+            break
+        
+        elif user_input == 'a':
+            auto_cycle(driver)
+            driver.set_cmd("OFF") # 循环结束后熄灭
+
+        elif user_input.isdigit():
+            idx = int(user_input)
+            if 0 <= idx < len(TEST_MENU):
+                key, desc, expect = TEST_MENU[idx]
+                print(f"\n✅ 已发送: {key}")
+                print(f"📝 状态: {desc}")
+                print(f"👁️ 预期视觉输出: {expect}")
+                driver.set_cmd(key)
+            else:
+                print("❌ 无效序号")
+        else:
+            print("❌ 无效输入")
 
 if __name__ == "__main__":
     main()

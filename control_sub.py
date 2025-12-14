@@ -1,142 +1,161 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-文件: control_sub.py (防抖动优化版)
-功能: 篮球寻迹 + 状态机 + 视觉暂留机制
+文件: control_single_search.py
+目标: 单车寻球闭环测试
+逻辑: 搜索(紫闪) -> 发现并靠近(红闪) -> 停稳(红亮)
 """
 
 import zmq
 import json
-import math
-import sys
 import time
+import sys
+import random
+import rospy
+
+# 初始化 ROS
+if not rospy.core.is_initialized():
+    rospy.init_node('single_search_test', anonymous=True, disable_signals=True)
 
 try:
     from robot_driver import RobotDriver
     from light_driver import LightDriver 
 except ImportError:
-    print("❌ 错误: 找不到驱动文件！")
+    print("❌ 错误: 找不到驱动文件")
     sys.exit(1)
 
-class BallController:
-    def __init__(self):
-        self.ROBOT_ID = 15
-        self.TARGET_DIST = 0.2
-        self.MAX_SPEED = 0.3
-        self.BROKER_IP = "10.0.2.66"
-        
-        # === 1. 新增：视觉暂留计时器 ===
-        self.last_ball_time = 0.0  # 上次看到球的时间戳
-        self.LOST_TIMEOUT = 1.0    # 忍受丢失的时间 (秒)，建议 0.5 ~ 1.0
-        
-        print(f"🏀 控制器启动 | ID: {self.ROBOT_ID}")
+# === 视觉 ID 映射 (必须与 vision_pub.py 一致) ===
+CLS_RED    = 2
+CLS_PURPLE = 4
+CLS_BALL   = 6
 
+class BallHunter:
+    def __init__(self):
+        # ⚠️ 修改你的 ID
+        self.ROBOT_ID = 15
+        self.BROKER_IP = "10.0.2.66"
+
+        # === 核心参数 (调试重点) ===
+        self.SEARCH_SPEED = 0.15      # 搜索时的转圈/前进速度
+        self.VISION_DIST_MAX = 2.0    # 2米内开始响应球
+        self.TARGET_DIST = 0.40       # 目标停车距离 (40cm)
+        self.STOP_TOLERANCE = 0.05    # 停车误差容忍度 (±5cm) -> 35~45cm 算停稳
+        
+        # PID 参数 (如果车晃得厉害，调小 Kp)
+        self.KP_LINEAR  = 0.6  # 前后速度系数
+        self.KP_ANGULAR = 0.02 # 转向速度系数
+
+        # 状态
+        self.state = "INIT"
+        
+        # 驱动
         try:
             self.driver = RobotDriver(self.ROBOT_ID)
-            self.light = LightDriver(self.ROBOT_ID, broker_ip=self.BROKER_IP) 
+            self.light = LightDriver(self.ROBOT_ID, broker_ip=self.BROKER_IP)
         except Exception as e:
-            print(f"❌ 驱动初始化失败: {e}")
+            print(f"❌ 驱动失败: {e}")
             sys.exit(1)
 
+        # 视觉通信
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
         self.socket.connect("tcp://localhost:5555") 
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "perception")
         self.socket.setsockopt(zmq.RCVTIMEO, 1000)
 
-        self.state = "INIT"
+        # 初始动作
         self.update_state("SEARCH")
 
     def update_state(self, new_state):
-        if self.state == new_state:
-            return
-        
+        if self.state == new_state: return
         self.state = new_state
-        print(f"🔄 状态切换: {new_state}")
-
+        print(f"🔄 状态切换 -> {new_state}")
+        
         if new_state == "SEARCH":
-            self.light.set_cmd("SEARCH")
+            self.light.set_cmd("SEARCH")        # 紫闪
         elif new_state == "APPROACH":
-            self.light.set_cmd("FOUND")
-        elif new_state == "ARRIVED":
-            self.light.set_cmd("ARRIVED")
-            self.driver.stop()
-        elif new_state == "LOST":
-            self.light.set_cmd("IDLE")
+            self.light.set_cmd("APPROACH_BALL") # 红闪 (表示正在动)
+        elif new_state == "ANCHOR":
+            self.light.set_cmd("LEADER_WAIT")   # 红亮 (表示停稳)
             self.driver.stop()
 
     def run(self):
-        print("🚀 主循环开始...")
+        print(f"🚀 单车寻球测试启动 | ID: {self.ROBOT_ID}")
+        print(f"🎯 目标: 找到篮球并停在 {self.TARGET_DIST}m 处")
+        
         while True:
             try:
                 msg = self.socket.recv_string()
                 _, json_str = msg.split(' ', 1)
                 data = json.loads(json_str)
-                pattern = data.get('pattern', 'IDLE')
                 
-                # 获取当前时间
-                now = time.time()
-
-                if pattern == 'BASKETBALL':
-                    # === 看到球了 ===
-                    # 1. 更新最后一次看到球的时间
-                    self.last_ball_time = now  # <--- 修改点：刷新计时器
-
-                    distance = data.get('distance', 0.0)
+                class_id = data.get('class_id', -1)
+                dist     = data.get('distance', 999.0)
+                
+                # === 逻辑核心 ===
+                
+                if class_id == CLS_BALL and dist < self.VISION_DIST_MAX:
+                    # --- 发现球 ---
                     
-                    if abs(distance - self.TARGET_DIST) < 0.05:
-                        self.update_state("ARRIVED")
-                        continue
-
-                    # 只要看到球，就强制切回 APPROACH (除非已经到了)
-                    if self.state != "ARRIVED":
+                    # 计算误差
+                    err_dist = dist - self.TARGET_DIST
+                    
+                    # 判断是否停稳 (迟滞比较，防止反复横跳)
+                    if abs(err_dist) < self.STOP_TOLERANCE:
+                        # 误差小于 5cm，认为到了
+                        self.update_state("ANCHOR")
+                    else:
+                        # 误差较大，需要调整
                         self.update_state("APPROACH")
-                    
-                    self.move_to_ball(data)
-
+                        self.visual_servo(data)
+                
                 else:
-                    # === 没看到球 ===
-                    if self.state == "ARRIVED": 
-                        continue
-
-                    # === 修改点：增加防抖逻辑 ===
-                    # 计算距离上次看到球过去了多久
-                    time_since_seen = now - self.last_ball_time
-                    
-                    if time_since_seen < self.LOST_TIMEOUT:
-                        # 虽然这一帧没看到，但在“忍受期”内，认为是视觉丢帧
-                        # 保持 APPROACH 状态，不要切 SEARCH
-                        # 可选：这期间可以让车稍微减速或者维持上一次的速度
+                    # --- 没看到球 ---
+                    if self.state == "ANCHOR":
+                        # 如果之前已经停稳了，偶尔丢一帧不要紧，保持不动
+                        # 除非连续丢很久（这里简化处理，不做超时）
                         pass 
                     else:
-                        # 真的超时了 (超过1秒没看到)，才认为是真丢了
+                        # 正在找，或者跟丢了
                         self.update_state("SEARCH")
+                        self.search_move()
 
             except zmq.Again:
-                print("⚠️ 视觉连接断开")
-                self.update_state("LOST")
-                
+                self.update_state("SEARCH")
+                self.search_move()
             except KeyboardInterrupt:
-                print("\n🛑 程序中止")
                 break
         
-        self.light.stop()
         self.driver.stop()
+        self.light.stop()
 
-    def move_to_ball(self, data):
-        distance = data.get('distance', 0.0)
+    def visual_servo(self, data):
+        """视觉伺服控制 (PID)"""
+        dist = data.get('distance', 0.0)
         bearing = data.get('bearing_body', 0.0)
         
-        error = distance - self.TARGET_DIST
-        v_cmd = error * 0.8
-        v_cmd = max(-self.MAX_SPEED, min(self.MAX_SPEED, v_cmd))
+        # 1. 距离控制 (Linear P)
+        error_dist = dist - self.TARGET_DIST
         
-        rad = math.radians(bearing)
-        vx = v_cmd * math.cos(rad)
-        vy = v_cmd * math.sin(rad)
+        # 如果距离太近(<0.4)，倒车(负速度)；如果远，前进(正速度)
+        # 限制最大速度 0.2 m/s，防止冲太快
+        v_cmd = error_dist * self.KP_LINEAR
+        v_cmd = max(-0.2, min(0.2, v_cmd))
         
-        self.driver.send_velocity_command(vx, vy, 0.0)
+        # 2. 角度控制 (Angular P)
+        # 目标是把球放在画面正中间 (bearing = 0)
+        w_cmd = bearing * self.KP_ANGULAR
+        w_cmd = max(-0.5, min(0.5, w_cmd)) # 限制最大转速
+        
+        # 3. 执行
+        self.driver.send_velocity_command(v_cmd, 0.0, w_cmd)
+
+    def search_move(self):
+        """没找到球时的动作"""
+        # 简单的原地旋转扫描，或者缓慢向前画圈
+        # 这里写死为：慢速左转 + 极慢速前进 (画大圈)
+        self.driver.send_velocity_command(0.05, 0.0, 0.15)
 
 if __name__ == "__main__":
-    c = BallController()
-    c.run()
+    test = BallHunter()
+    test.run()
