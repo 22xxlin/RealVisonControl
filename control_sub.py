@@ -47,8 +47,8 @@ class SwarmController:
         
         # === 核心阈值 ===
         self.DIST_FIND_BALL   = 0.8
-        self.DIST_STOP_BALL   = 0.2
-        self.DIST_TRIANGLE    = 0.8
+        self.DIST_STOP_BALL   = 0.23
+        self.DIST_TRIANGLE    = 0.5
         self.DIST_FINISH      = 1.5
         
         # === 连续帧滤波参数 (关键新增) ===
@@ -233,7 +233,7 @@ class SwarmController:
     def maintain_formation(self, dist, bearing):
         """Follower 保持阵型"""
         dist_err = dist - self.DIST_TRIANGLE
-        v_x = max(-0.2, min(0.2, dist_err * 0.8))
+        v_x = max(-0.2, min(0.2, -dist_err * 0.8))
         bearing_err = normalize_angle(bearing - self.target_slot_angle)
         v_y = bearing_err * 0.015
         v_y = max(-0.2, min(0.2, v_y))
