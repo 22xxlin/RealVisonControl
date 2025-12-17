@@ -21,7 +21,7 @@ FLASH, EQUAL, ALWAYS_ON = [6, 2], [2, 6], [8]
 LED_PATTERNS = {
     "red_flash": {"name": "红色闪烁", "colors": [RED, BLACK], "counts": FLASH, "cycles": 9, "frequency": 14.4},
     "red_equal": {"name": "红色均等", "colors": [RED, BLACK], "counts": EQUAL, "cycles": 9, "frequency": 14.4},
-    "red_on": {"name": "红色常亮", "colors": [RED], "counts": ALWAYS_ON, "cycles": 9, "frequency": 14.4},
+    "red_on": {"name": "红色常亮", "colors": [RED], "counts": ALWAYS_ON, "cycles": 9000, "frequency": 14.4},
     "blue_flash": {"name": "蓝色闪烁", "colors": [BLUE, BLACK], "counts": FLASH, "cycles": 9, "frequency": 14.4},
     "blue_equal": {"name": "蓝色均等", "colors": [BLUE, BLACK], "counts": EQUAL, "cycles": 9, "frequency": 14.4},
     "blue_on": {"name": "蓝色常亮", "colors": [BLUE], "counts": ALWAYS_ON, "cycles": 9, "frequency": 14.4},

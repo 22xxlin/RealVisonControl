@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 文件: control_sub.py
-版本: 最终发布版 (Robust Debounce)
-更新点:
-  1. 引入连续帧检测: 必须连续 6 帧看到红灯才变 Follower
-  2. 保持之前的: 矢量分解(解决乱跑)、全向锁定、无限视距
+版本: 编队调试专用版 (Formation Debug Mode)
+功能: 
+  1. 专注于调试 "Search -> Discover -> Form Triangle" 流程。
+  2. 🚫 禁用了所有 "搬运 (Transport)" 相关的状态跳转。
+  3. ✅ 当队形组建完成后，所有车会保持静止并亮灯，方便拍照/测量。
 """
 
 import zmq
@@ -51,10 +52,10 @@ class SwarmController:
         self.DIST_TRIANGLE    = 0.5
         self.DIST_FINISH      = 1.5
         
-        # === 连续帧滤波参数 (关键新增) ===
-        self.RED_CONFIRM_THRESHOLD = 6  # 需要连续看到6次
-        self.red_detect_count = 0       # 当前计数
-        self.last_red_time = 0.0        # 上次看到的时间
+        # === 连续帧滤波参数 ===
+        self.RED_CONFIRM_THRESHOLD = 6
+        self.red_detect_count = 0 
+        self.last_red_time = 0.0
         
         # === 搜索参数 ===
         self.SEARCH_SPEED  = 0.2
@@ -105,15 +106,18 @@ class SwarmController:
             if self.target_slot_angle < 0:  self.light.set_cmd("BID_LEFT")
             else:                           self.light.set_cmd("BID_RIGHT")
         elif new_state == "READY":
+            # 锁定状态: 绿灯(左) 或 蓝灯(右) 常亮
             if self.target_slot_angle < 0:  self.light.set_cmd("LOCK_LEFT")
             else:                           self.light.set_cmd("LOCK_RIGHT")
             self.driver.stop()
-        elif new_state == "TRANSPORT_LEADER": self.light.set_cmd("LEADER_GO")
-        elif new_state == "TRANSPORT_FOLLOWER": self.light.set_cmd("FOLLOWER_PUSH")
-        elif new_state == "FINISH":         self.light.set_cmd("OFF"); self.driver.stop()
+            
+        # 🚫 --- 以下状态被屏蔽 (Debug Mode) ---
+        # elif new_state == "TRANSPORT_LEADER": self.light.set_cmd("LEADER_GO")
+        # elif new_state == "TRANSPORT_FOLLOWER": self.light.set_cmd("FOLLOWER_PUSH")
+        # elif new_state == "FINISH":         self.light.set_cmd("OFF"); self.driver.stop()
 
     def run(self):
-        print(f"🚀 全向蜂群启动 | ID: {self.ROBOT_ID} | Slot: {self.slot_name}")
+        print(f"🚀 编队调试模式启动 | ID: {self.ROBOT_ID} | Slot: {self.slot_name}")
         
         while True:
             try:
@@ -132,38 +136,24 @@ class SwarmController:
 
                 # --- A. 搜索者 (SEARCHER) ---
                 if self.my_role == "SEARCHER":
-                    # 1. 发现球 -> 变 Leader
                     if class_id == CLS_BALL and dist < self.DIST_FIND_BALL:
                         self.my_role = "LEADER"
                         self.move_to_ball(dist, bearing)
                     
-                    # 2. 发现红灯 -> 变 Follower (⚠️ 核心修改: 连续帧滤波)
                     elif class_id == CLS_RED:
-                        # 如果距离上一次看到红灯不超过 0.3s (说明是连续的)
                         if now - self.last_red_time < 0.3:
                             self.red_detect_count += 1
                         else:
-                            # 如果断了很久，重置计数
                             self.red_detect_count = 1
-                        
-                        # 更新时间戳
                         self.last_red_time = now
                         
-                        # 打印调试信息，让你看到进度
-                        # print(f"🧐 疑似发现 Leader... 确认度: {self.red_detect_count}/{self.RED_CONFIRM_THRESHOLD}")
-                        
-                        # 只有攒够 6 次才切换
                         if self.red_detect_count >= self.RED_CONFIRM_THRESHOLD:
-                            print(f"✅ 确认发现 Leader (连续 {self.red_detect_count} 帧)! 切换身份...")
+                            print(f"✅ 发现 Leader! 切换身份...")
                             self.my_role = "FOLLOWER"
                             self.update_state("BIDDING")
                     
-                    # 3. 没发现 -> 搜索
                     else:
-                        # (可选) 如果很久没看到红灯了，要把计数器清零，防止跨时间累积
-                        if now - self.last_red_time > 1.0:
-                            self.red_detect_count = 0
-                            
+                        if now - self.last_red_time > 1.0: self.red_detect_count = 0
                         self.update_state("SEARCH")
                         self.omni_search_move()
 
@@ -172,28 +162,40 @@ class SwarmController:
                     if self.state == "APPROACH_BALL":
                         if class_id == CLS_BALL: self.move_to_ball(dist, bearing)
                         else: self.driver.stop()
+                    
                     elif self.state == "LEADER_WAIT":
+                        # 仅检测就位，不触发搬运
                         if class_id == CLS_GREEN and pattern == 'SOLID': self.last_seen_left_ready = now
                         if class_id == CLS_BLUE and pattern == 'SOLID':  self.last_seen_right_ready = now
-                        if (now - self.last_seen_left_ready < 1.0) and (now - self.last_seen_right_ready < 1.0):
-                            self.update_state("TRANSPORT_LEADER")
-                    elif self.state == "TRANSPORT_LEADER":
-                        if class_id == CLS_FLAG:
-                            if dist < self.DIST_FINISH: self.update_state("FINISH")
-                            else: self.move_towards_flag(bearing)
-                        else:
-                            self.driver.send_velocity_command(0.15, 0.0, 0.0)
+                        
+                        # 检测到双侧就位 -> 仅打印 Log，不跳转
+                        is_left_ready = (now - self.last_seen_left_ready < 1.0)
+                        is_right_ready = (now - self.last_seen_right_ready < 1.0)
+                        
+                        if is_left_ready and is_right_ready:
+                            print("🎉🎉🎉 [SUCCESS] 编队组建完成！所有单位就位！ 🎉🎉🎉")
+                            # 可以在这里让 Leader 闪烁庆祝一下，或者保持静止
+                        elif is_left_ready:
+                            print("⏳ 左侧就位... 等待右侧")
+                        elif is_right_ready:
+                            print("⏳ 右侧就位... 等待左侧")
+                            
+                        # 🚫 屏蔽跳转
+                        # if ...: self.update_state("TRANSPORT_LEADER")
+
+                    # 🚫 屏蔽搬运逻辑
+                    # elif self.state == "TRANSPORT_LEADER": ...
 
                 # --- C. 队员 (FOLLOWER) ---
                 elif self.my_role == "FOLLOWER":
-                    if class_id == CLS_PURPLE or self.state == "TRANSPORT_FOLLOWER":
-                        self.update_state("TRANSPORT_FOLLOWER")
-                        self.driver.send_velocity_command(0.15, 0.0, 0.0)
-                    elif class_id == CLS_RED:
+                    # 🚫 屏蔽收到紫色灯的搬运指令
+                    # if class_id == CLS_PURPLE: ...
+                    
+                    if class_id == CLS_RED:
                         self.maintain_formation(dist, bearing)
                     else:
-                        if self.state == "TRANSPORT_FOLLOWER": self.driver.stop()
-                        else: self.driver.stop()
+                        # 丢失目标时停车
+                        self.driver.stop()
 
             except zmq.Again:
                 if self.my_role == "SEARCHER": self.omni_search_move()
@@ -218,7 +220,7 @@ class SwarmController:
         self.driver.send_velocity_command(vx, vy, 0.0)
 
     def move_to_ball(self, dist, bearing):
-        """Leader 找球 (矢量分解版)"""
+        """Leader 找球"""
         dist_error = dist - self.DIST_STOP_BALL
         if dist_error > 0:
             self.update_state("APPROACH_BALL")
@@ -233,20 +235,27 @@ class SwarmController:
     def maintain_formation(self, dist, bearing):
         """Follower 保持阵型"""
         dist_err = dist - self.DIST_TRIANGLE
-        v_x = max(-0.2, min(0.2, -dist_err * 0.8))
+        
+        # 1. 距离控制 (P控制)
+        v_x = max(-0.2, min(0.2, -dist_err * 0.8)) # 负号因为我们要靠近
+        
+        # 2. 角度控制 (P控制)
         bearing_err = normalize_angle(bearing - self.target_slot_angle)
         v_y = bearing_err * 0.015
         v_y = max(-0.2, min(0.2, v_y))
         
+        # 3. 判定是否就位 (阈值要调好，太严很难READY，太松队形不准)
+        # 距离误差 < 15cm, 角度误差 < 15度
         if abs(dist_err) < 0.15 and abs(bearing_err) < 15.0:
             self.update_state("READY")
+            # ⚠️ 调试核心: 一旦 READY，强制停车，防止在临界点抖动
+            self.driver.stop() 
         else:
             self.update_state("BIDDING")
-        self.driver.send_velocity_command(v_x, v_y, 0.0)
+            self.driver.send_velocity_command(v_x, v_y, 0.0) # 只有没就位才动
 
     def move_towards_flag(self, bearing):
-        v_y = bearing * 0.01
-        self.driver.send_velocity_command(0.15, v_y, 0.0)
+        pass # Debug模式下禁用
 
 if __name__ == "__main__":
     c = SwarmController()
