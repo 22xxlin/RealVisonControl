@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-data_logger.py
-功能：同时监听 Vicon (真值) 和 ZMQ (视觉)，记录并对比误差。
-输出：屏幕打印 + CSV 文件保存
+文件: data_logger.py (双模版)
+功能: 
+  1. 自动记录球 (Class 6) -> 对比 Target Vicon 真值
+  2. 自动记录车 (Class 0-5) -> 对比 Leader Vicon 真值 (用于调试融合参数)
 """
 
 import rospy
@@ -16,11 +17,12 @@ import datetime
 from geometry_msgs.msg import TransformStamped
 
 # ================= 配置 =================
-# Vicon 话题
-ROBOT_VICON_TOPIC  = "vicon/VSWARM15/VSWARM15"
-TARGET_VICON_TOPIC = "vicon/VSWARM45/VSWARM45" # 你的球
+# 请确保这些 Topic 对应正确的 Vicon 对象
+ROBOT_VICON_TOPIC  = "/vicon/VSWARM15/VSWARM15"  # 观测者 (本机)
+TARGET_VICON_TOPIC = "/vicon/VSWARM45/VSWARM45"  # 球 (Ball) 的真值
+LEADER_VICON_TOPIC = "/vicon/VSWARM13/VSWARM13"  # 另一辆车 (Leader) 的真值
 
-# ZMQ 配置 (对应 vision_pub.py)
+# ZMQ 配置
 ZMQ_PORT = 5555
 
 # ================= 工具 =================
@@ -31,38 +33,46 @@ def quat_to_yaw_deg(x, y, z, w):
     return (math.degrees(yaw) + 360.0) % 360.0
 
 def normalize_angle(angle):
+    """归一化到 [-180, 180]"""
     return (angle + 180.0) % 360.0 - 180.0
 
-class CalibrationLogger:
+class FullLogger:
     def __init__(self):
-        # 1. 初始化 ROS (Vicon)
-        rospy.init_node('calibration_logger', anonymous=True)
-        self.poses = {'robot': None, 'target': None}
+        rospy.init_node('full_data_logger', anonymous=True)
         
+        # 1. 状态存储
+        self.poses = {'robot': None, 'target': None, 'leader': None}
+        
+        # 2. 订阅 Vicon
         rospy.Subscriber(ROBOT_VICON_TOPIC, TransformStamped, self._cb, 'robot')
         rospy.Subscriber(TARGET_VICON_TOPIC, TransformStamped, self._cb, 'target')
+        rospy.Subscriber(LEADER_VICON_TOPIC, TransformStamped, self._cb, 'leader')
         
-        # 2. 初始化 ZMQ (Vision)
+        # 3. ZMQ 连接
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
         self.socket.connect(f"tcp://localhost:{ZMQ_PORT}")
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "perception")
         
-        # 3. CSV 文件
+        # 4. CSV 初始化
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.filename = f"log_vision_vs_vicon_{ts}.csv"
+        self.filename = f"log_full_{ts}.csv"
         self.csv_file = open(self.filename, 'w', newline='')
         self.writer = csv.writer(self.csv_file)
-        # 写入表头
-        self.writer.writerow([
-            "Time", 
-            "Vicon_Dist", "Vision_Dist", "Dist_Err",
-            "Vicon_Angle", "Vision_Angle", "Angle_Err",
-            "Vision_Class", "Cam_ID"
-        ])
         
-        print(f"📝 日志记录中: {self.filename}")
-        print(f"📡 等待 Vicon ({ROBOT_VICON_TOPIC}) 和 Vision 数据...")
+        # CSV 表头
+        header = [
+            "Time", 
+            "Vision_Dist", "Vision_Geo", "Vision_Width", # 视觉数据
+            "Vicon_Dist", "Dist_Err",                    # 距离真值与误差
+            "Vision_Ang", "Vicon_Ang", "Ang_Err",        # 角度真值与误差
+            "Target_Type", "Vision_Class", "Cam_ID"      # 目标类型标记
+        ]
+        self.writer.writerow(header)
+        
+        print(f"📝 双模日志记录中: {self.filename}")
+        print("   - Class 6 (Ball) -> 对比 Target (VSWARM45)")
+        print("   - Class 0-5 (Car) -> 对比 Leader (VSWARM10)")
 
     def _cb(self, msg, key):
         x = msg.transform.translation.x
@@ -71,28 +81,37 @@ class CalibrationLogger:
         yaw = quat_to_yaw_deg(rot.x, rot.y, rot.z, rot.w)
         self.poses[key] = {'x': x, 'y': y, 'yaw': yaw, 'ts': time.time()}
 
-    def get_vicon_truth(self):
+    def get_ground_truth(self, target_key):
+        """
+        动态计算本机(robot)与指定目标(target_key)之间的真值关系
+        target_key: 'target' (对于球) 或 'leader' (对于车)
+        """
         p_r = self.poses['robot']
-        p_t = self.poses['target']
+        p_t = self.poses[target_key] # 动态取目标
         now = time.time()
         
-        if not p_r or not p_t: return None, None
-        if (now - p_r['ts'] > 0.5) or (now - p_t['ts'] > 0.5): return None, None
+        # 基础检查
+        if not p_r or not p_t: return None
+        # 数据超时检查 (0.5s)
+        if (now - p_r['ts'] > 0.5) or (now - p_t['ts'] > 0.5): return None
         
+        # 计算距离
         dx = p_t['x'] - p_r['x']
         dy = p_t['y'] - p_r['y']
+        vicon_dist = math.hypot(dx, dy)
         
-        dist = math.hypot(dx, dy)
-        global_angle = math.degrees(math.atan2(dy, dx))
-        # Vicon计算的相对角度 (Body Frame)
-        rel_angle = normalize_angle(global_angle - p_r['yaw'])
+        # 计算相对角度 (Bearing)
+        global_ang = math.degrees(math.atan2(dy, dx))
+        vicon_rel_ang = normalize_angle(global_ang - p_r['yaw'])
         
-        return dist, rel_angle
+        return {
+            'vicon_dist': vicon_dist,
+            'vicon_rel_ang': vicon_rel_ang
+        }
 
     def run(self):
         try:
             while not rospy.is_shutdown():
-                # 1. 阻塞接收视觉数据 (以视觉帧为触发)
                 try:
                     msg = self.socket.recv_string(flags=zmq.NOBLOCK)
                     payload = json.loads(msg.split(' ', 1)[1])
@@ -100,42 +119,51 @@ class CalibrationLogger:
                     time.sleep(0.001)
                     continue
                 
-                # 只关心球 (Class 6)
-                if payload.get('class_id') != 6:
-                    continue
-                    
+                cls_id = payload.get('class_id')
+                
+                # === 自动决定对比目标 ===
+                if cls_id == 6:
+                    target_key = 'target' # 球 -> 对比球的Vicon
+                    target_label = "BALL"
+                else:
+                    target_key = 'leader' # 车 -> 对比Leader的Vicon (用于校准融合参数)
+                    target_label = "CAR " # 加空格为了对齐
+                
+                # === 获取数据 ===
                 vis_dist = payload.get('distance')
-                vis_ang  = payload.get('bearing_body')
-                cam_id   = payload.get('cam_idx')
+                vis_geo = payload.get('dist_geo', -1.0)
+                vis_width = payload.get('dist_width', -1.0)
+                vis_ang = payload.get('bearing_body')
+                cam_id = payload.get('cam_idx')
                 
-                # 2. 获取当前时刻的 Vicon 真值
-                vic_dist, vic_ang = self.get_vicon_truth()
+                # === 获取对应的真值 ===
+                gt = self.get_ground_truth(target_key)
                 
-                if vic_dist is not None:
-                    # 3. 计算误差
-                    dist_err = vis_dist - vic_dist
-                    ang_err  = normalize_angle(vis_ang - vic_ang)
+                if gt:
+                    dist_err = vis_dist - gt['vicon_dist']
+                    ang_err = normalize_angle(vis_ang - gt['vicon_rel_ang'])
                     
-                    # 4. 打印与记录
-                    # 绿色表示误差小，红色表示误差大 (仅打印效果)
-                    status = "✅" if abs(dist_err) < 0.1 else "❌"
+                    status = "✅" if abs(dist_err) < 0.15 else "❌"
                     
-                    print(f"{status} [Cam{cam_id}] "
-                          f"Dist: {vis_dist:.2f}v / {vic_dist:.2f}gt (Err: {dist_err:+.2f}) | "
-                          f"Ang: {vis_ang:5.1f}v / {vic_ang:5.1f}gt (Err: {ang_err:+.1f})")
+                    # 打印 Log (包含类型标记)
+                    print(f"{status} [{target_label}-Cam{cam_id}] "
+                          f"Fus:{vis_dist:.2f} (G:{vis_geo:.1f}/W:{vis_width:.1f}) | "
+                          f"Err:{dist_err:+.2f}m")
                     
+                    # 写入 CSV
                     self.writer.writerow([
                         time.time(),
-                        f"{vic_dist:.4f}", f"{vis_dist:.4f}", f"{dist_err:.4f}",
-                        f"{vic_ang:.4f}", f"{vis_ang:.4f}", f"{ang_err:.4f}",
-                        payload['class_id'], cam_id
+                        f"{vis_dist:.4f}", f"{vis_geo:.4f}", f"{vis_width:.4f}",
+                        f"{gt['vicon_dist']:.4f}", f"{dist_err:.4f}",
+                        f"{vis_ang:.4f}", f"{gt['vicon_rel_ang']:.4f}", f"{ang_err:.4f}",
+                        target_label, cls_id, cam_id
                     ])
                     
         except KeyboardInterrupt:
-            print(f"\n💾 数据已保存至 {self.filename}")
+            print(f"\n💾 Log 保存完毕: {self.filename}")
         finally:
             self.csv_file.close()
 
 if __name__ == "__main__":
-    logger = CalibrationLogger()
+    logger = FullLogger()
     logger.run()
