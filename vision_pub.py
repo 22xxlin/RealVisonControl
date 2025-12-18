@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-文件: vision_pub.py (V3.1 调试版)
-功能: 视觉感知发布
-升级点:
-  1. 输出 fused (融合), geo (几何), width (宽度) 三种距离供数据记录。
-  2. 修复了 Tuple 对比 Float 的类型错误。
-  3. ZMQ 输出限频 (10Hz).
+文件: vision_pub.py (V3.2 内部融合版)
+功能: 多摄视觉感知、内部融合、择优发送
+更新日志:
+  1. 架构升级: 采用 "收集 -> 排序 -> 去重 -> 发送" 的 20Hz 周期性逻辑。
+  2. 融合策略: 相同角度的物体，保留检测框面积(Area)最大的那个。
+  3. 测距算法: 纯宽度法 (Width-Based)，移除了几何法。
+  4. 边缘检测: 识别并标记被截断的物体。
 """
 
 import os
@@ -25,10 +26,10 @@ from ultralytics import YOLO
 MODEL_PATH = "/home/nvidia/Downloads/Ros/ballCar2/weights/weights/best.engine"
 CAMERA_INDICES = [0, 2, 4, 6]
 ZMQ_PORT = 5555
-PUBLISH_RATE_LIMIT = 0.05  # 限制 ZMQ 发送间隔 (10Hz)
-STATE_LOCK_DURATION = 0.5 # 状态切换锁定时间
+FUSION_RATE_HZ = 20        # 融合与发送频率 (20Hz = 50ms)
+STATE_LOCK_DURATION = 0.5  # 状态切换锁定时间
 
-# === 物理与几何参数 ===
+# === 物理参数 ===
 # 真实宽度 (单位: 米)
 CLASS_REAL_WIDTHS = {
     "car": 0.31,
@@ -36,16 +37,14 @@ CLASS_REAL_WIDTHS = {
     "flag": 0.13
 }
 
-# 几何测距高度参数 (单位: 米)
-CAM_HEIGHT = 0.15      # 相机离地高度
-OBJ_HEIGHT = 0.20      # 小车塔顶高度 (仅用于 0-5 类)
-
-# 相机内参 (请根据实际标定修改)
+# 相机内参 (标定分辨率: 640x480)
 CAM_INTRINSICS = {
     'fx': 498.0,
     'fy': 498.0,
     'cx': 331.2797,
-    'cy': 156.1371
+    'cy': 156.1371,
+    'calib_width': 640,
+    'calib_height': 480
 }
 
 # Class ID 映射
@@ -54,47 +53,52 @@ CLS_MAP = {
     4: "PURPLE", 5: "GRAY", 6: "BALL", 7: "FLAG"
 }
 
-# 相机朝向
+# 相机朝向 (机身坐标系)
 CAM_MOUNT_YAW_DEG = {0: 180.0, 2: -90.0, 4: 0.0, 6: 90.0}
 
 # ================= 辅助函数 =================
 def calculate_azimuth_planar(x_pixel, fx, cx):
+    """计算像平面内的偏航角"""
     pixel_offset = x_pixel - cx
     angle_rad = math.atan(pixel_offset / fx)
-    angle_deg = math.degrees(angle_rad)
-    return (angle_deg + 360.0) % 360.0 if angle_deg < 0 else angle_deg
+    return math.degrees(angle_rad)
 
 def wrap_deg_360(a):
+    """归一化到 0-360 度"""
     return (a + 360.0) % 360.0
+
+def get_angle_diff(a1, a2):
+    """计算两个角度的最小差值 (考虑0/360循环)"""
+    diff = abs(a1 - a2)
+    return min(diff, 360.0 - diff)
 
 # ================= 主类定义 =================
 class VisionPublisher:
-    def __init__(self, model_path, camera_indices, zmq_port=5555, debounce_maxlen=30):
+    def __init__(self, model_path, camera_indices, zmq_port=5555):
         self.model_path = model_path
         self.camera_indices = camera_indices
-        self.zmq_port = zmq_port
-        
-        # 加载内参
-        self.fx = CAM_INTRINSICS['fx']
-        self.fy = CAM_INTRINSICS['fy']
-        self.cx = CAM_INTRINSICS['cx']
-        self.cy = CAM_INTRINSICS['cy']
 
-        self.queue = queue.Queue(maxsize=100)
+        # 核心参数
+        self.fx = CAM_INTRINSICS['fx']
+        self.cx = CAM_INTRINSICS['cx']
+        self.calib_width = CAM_INTRINSICS['calib_width']
+        self.calib_height = CAM_INTRINSICS['calib_height']
+
+        # 实际运行分辨率
+        self.actual_width = 640
+        self.actual_height = 480
+
+        # 通信与队列
+        self.queue = queue.Queue(maxsize=200) # 稍微加大队列，防止多摄数据瞬间堆积
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
-        self.socket.bind(f"tcp://*:{self.zmq_port}")
+        self.socket.bind(f"tcp://*:{zmq_port}")
         
-        # 历史缓存: Key=(cam_idx, track_id)
-        self.history = defaultdict(lambda: deque(maxlen=debounce_maxlen))
-        
-        # 状态记忆
+        # 状态滤波缓存
+        self.history = defaultdict(lambda: deque(maxlen=30))
         self.state_memory = defaultdict(lambda: {'state': 0, 'pattern': 'OFF', 'last_switch_time': 0.0})
-        
-        # 发布限频
-        self.last_pub_time = 0.0
 
-        print(f"✅ 视觉发布者启动 (调试版 V3.1) | 模型: {self.model_path}")
+        print(f"✅ 视觉融合系统 V3.2 启动 | 频率: {FUSION_RATE_HZ}Hz")
 
     def initialize_camera(self, cam_idx):
         try:
@@ -105,107 +109,58 @@ class VisionPublisher:
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+
+                # 验证实际分辨率并调整 fx
+                actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if actual_w != self.calib_width:
+                    scale = actual_w / self.calib_width
+                    self.fx = CAM_INTRINSICS['fx'] * scale
+                    self.cx = CAM_INTRINSICS['cx'] * scale
+                    self.actual_width = actual_w
+                    self.actual_height = actual_h
+                    print(f"⚠️ Cam {cam_idx}: 分辨率 {actual_w}x{actual_h}, fx 已缩放至 {self.fx:.2f}")
+
                 return cap
         except Exception: pass
         return None
 
     def get_stable_state(self, cam_idx, track_id, current_class_id):
-        """
-        迟滞比较 (Hysteresis) + 状态锁定
-        """
+        """颜色状态防抖动逻辑"""
+        if current_class_id >= 6: return current_class_id, "SOLID" # 球和旗子不滤波
+
         key = (cam_idx, track_id)
         mem = self.state_memory[key]
         now = time.time()
 
-        if current_class_id >= 6: return current_class_id, "SOLID"
-
         self.history[key].append(current_class_id)
         buffer = list(self.history[key])
 
+        # 简单的投票机制
+        from collections import Counter
         colored_frames = [c for c in buffer if c in [1, 2, 3, 4, 5]]
         if not colored_frames: return 0, "OFF"
-
-        from collections import Counter
-        counts = Counter(colored_frames)
-        dominant_color, count = counts.most_common(1)[0]
+        
+        dominant_color, count = Counter(colored_frames).most_common(1)[0]
         color_ratio = count / len(buffer)
         
-        if mem['pattern'] == 'SOLID':
-            new_pattern = 'FLASH' if color_ratio < 0.80 else 'SOLID'
-        else:
-            new_pattern = 'SOLID' if color_ratio > 0.90 else 'FLASH'
+        # 模式判定 (闪烁 vs 常亮)
+        target_pattern = 'SOLID' if color_ratio > 0.90 else 'FLASH'
+        if mem['pattern'] == 'SOLID' and color_ratio < 0.80: target_pattern = 'FLASH'
 
-        if new_pattern != mem['pattern'] or dominant_color != mem['state']:
-            if now - mem['last_switch_time'] < STATE_LOCK_DURATION:
-                return mem['state'], mem['pattern']
-            else:
+        # 状态锁定 (防止颜色并在跳变)
+        if (target_pattern != mem['pattern'] or dominant_color != mem['state']):
+            if now - mem['last_switch_time'] > STATE_LOCK_DURATION:
                 mem['state'] = dominant_color
-                mem['pattern'] = new_pattern
+                mem['pattern'] = target_pattern
                 mem['last_switch_time'] = now
-                return dominant_color, new_pattern
-        else:
-            return dominant_color, new_pattern
-
-    def calculate_fused_distance(self, bbox_xyxy, class_id):
-        """
-        🔥 核心升级：同时返回 (融合值, 几何值, 宽度值)
-        """
-        x1, y1, x2, y2 = bbox_xyxy
-        box_width = x2 - x1
-        box_height = y2 - y1
         
-        # 1. 基础检查
-        if box_width <= 0 or box_height <= 0: 
-            return 999.0, -1.0, -1.0
-
-        # --- A. 宽度测距法 (通用) ---
-        if class_id == 6: real_w = CLASS_REAL_WIDTHS["basketball"]
-        elif class_id == 7: real_w = CLASS_REAL_WIDTHS["flag"]
-        else: real_w = CLASS_REAL_WIDTHS["car"]
-        
-        dist_width = (real_w * self.fx) / box_width
-        
-        # 默认值
-        dist_geo = -1.0
-        fused_dist = dist_width
-
-        # --- B. 融合逻辑 (仅针对小车 0-5) ---
-        if 0 <= class_id <= 5:
-            # 1. 几何测距 (假设倒立摄像头，取 y2 为塔顶)
-            y_top_pixel = y2 
-            v = y_top_pixel - self.cy
-            
-            if abs(v) < 1e-5: v = 1e-5
-            
-            # 计算俯仰角
-            alpha = math.atan(v / self.fy)
-            total_angle = alpha + 0.0 
-            
-            dH = OBJ_HEIGHT - CAM_HEIGHT
-            
-            if total_angle > 0.001:
-                dist_geo = abs(dH / math.tan(total_angle))
-            else:
-                dist_geo = 99.9 
-
-            # 2. 宽高比检查 (遮挡检测)
-            current_ratio = box_width / box_height
-            OCCLUSION_THRESHOLD = 0.9 
-
-            if dist_geo < 15.0: 
-                if current_ratio < OCCLUSION_THRESHOLD:
-                    # ⚠️ 判定为遮挡 -> 全信几何法
-                    fused_dist = dist_geo
-                else:
-                    # ✅ 判定为正常 -> 加权融合
-                    fused_dist = 0.4 * dist_geo + 0.6 * dist_width
-            else:
-                fused_dist = dist_width
-        
-        # 非小车 (球、旗子) 直接返回宽度距离，dist_geo 保持 -1.0
-        return fused_dist, dist_geo, dist_width
+        return mem['state'], mem['pattern']
 
     def camera_worker(self, cam_idx):
+        """
+        相机工作线程：只负责检测和计算基础数据，不负责融合。
+        """
         try:
             model = YOLO(self.model_path)
             self.queue.put({'type': 'log', 'message': f'✅ Cam {cam_idx}: Ready'})
@@ -226,87 +181,171 @@ class VisionPublisher:
 
                 if results[0].boxes is not None:
                     for box in results[0].boxes:
-                        raw_class_id = int(box.cls.item())
-                        track_id = int(box.id.item()) if box.id is not None else -1
-                        if track_id < 0: continue
+                        raw_cls = int(box.cls.item())
+                        tid = int(box.id.item()) if box.id is not None else -1
+                        if tid < 0: continue
 
+                        # 1. 获取检测框数据
                         xyxy = box.xyxy[0].cpu().numpy()
-                        x_center = (xyxy[0] + xyxy[2]) / 2
-
-                        stable_class, pattern = self.get_stable_state(cam_idx, track_id, raw_class_id)
+                        x1, y1, x2, y2 = xyxy
+                        box_w = x2 - x1
+                        box_h = y2 - y1
+                        x_center = (x1 + x2) / 2
                         
-                        if stable_class == 0: continue
+                        # 计算面积
+                        area = box_w * box_h
 
-                        # 🔥 修复点：正确解包三个返回值
-                        fused_dist, dist_geo, dist_width = self.calculate_fused_distance(xyxy, stable_class)
-                        
+                        # 2. 截断检测 (Truncated)
+                        # 如果框的边缘贴近图像边界 (假设 640x480)，说明物体可能不完整
+                        is_truncated = (x1 < 2 or y1 < 2 or x2 > 638 or y2 > 478)
+
+                        # 3. 状态滤波
+                        stable_cls, pattern = self.get_stable_state(cam_idx, tid, raw_cls)
+                        if stable_cls == 0: continue
+
+                        # 4. 纯宽度测距
+                        if stable_cls == 6: real_w = CLASS_REAL_WIDTHS["basketball"]
+                        elif stable_cls == 7: real_w = CLASS_REAL_WIDTHS["flag"]
+                        else: real_w = CLASS_REAL_WIDTHS["car"]
+
+                        # 确保 box_w 有效
+                        if box_w <= 0:
+                            continue
+
+                        dist = (real_w * self.fx) / box_w
+
+                        # 5. 角度解算
                         azimuth = calculate_azimuth_planar(x_center, self.fx, self.cx)
                         bearing_body = wrap_deg_360(CAM_MOUNT_YAW_DEG.get(cam_idx, 0.0) + azimuth)
 
-                        # 过滤太远的噪点 (使用 fused_dist 比较，而不是 Tuple)
-                        if fused_dist < 8.0:
+                        # 6. 打包入队 (包含 area 和 truncated 供主线程融合使用)
+                        if dist < 8.0:
                             data = {
                                 'type': 'detection',
                                 'cam_idx': cam_idx,
-                                'track_id': track_id,
-                                'class_id': stable_class,
+                                'class_id': stable_cls,
                                 'pattern': pattern,
-                                'distance': round(fused_dist, 2),  # 融合后的距离
-                                'dist_geo': round(dist_geo, 2),    # 几何原始值
-                                'dist_width': round(dist_width, 2),# 宽度原始值
-                                'bearing_body': round(bearing_body, 2)
+                                'distance': round(dist, 2),
+                                'bearing_body': round(bearing_body, 2),
+                                'area': int(area),          # 融合权重核心
+                                'truncated': is_truncated   # 降权标志
                             }
+                            # 非阻塞入队，满了就扔掉旧的
                             try: self.queue.put_nowait(data)
                             except queue.Full: pass
+                            
         except Exception as e:
             print(f"Cam {cam_idx} Error: {e}")
         finally:
             cap.release()
 
     def run(self):
-        print('🚀 视觉系统运行中 (10Hz 限频输出)...')
+        """
+        主循环：周期性融合 (Batch Processing)
+        """
+        print(f'🚀 视觉融合循环启动... (周期: {1.0/FUSION_RATE_HZ*1000:.1f}ms)')
         
-        threads = []
+        # 启动线程
         for idx in self.camera_indices:
-            t = threading.Thread(target=self.camera_worker, args=(idx,), daemon=True)
-            t.start()
-            threads.append(t)
+            threading.Thread(target=self.camera_worker, args=(idx,), daemon=True).start()
 
+        fusion_interval = 1.0 / FUSION_RATE_HZ
+        
         try:
             while True:
-                data = self.queue.get()
+                cycle_start = time.time()
                 
-                if data['type'] == 'log':
-                    print(data['message'])
+                # --- 1. 收集阶段 (Drain Queue) ---
+                # 把当前瞬间队列里所有相机的数据全取出来
+                batch_detections = []
+                while True:
+                    try:
+                        item = self.queue.get_nowait()
+                        if item['type'] == 'log':
+                            print(item['message'])
+                        elif item['type'] == 'detection':
+                            batch_detections.append(item)
+                        self.queue.task_done()
+                    except queue.Empty:
+                        break # 队列空了，收集完毕
                 
-                elif data['type'] == 'detection':
-                    now = time.time()
-                    if now - self.last_pub_time > PUBLISH_RATE_LIMIT:
-                        
-                        topic = "perception"
-                        pub_data = {k:v for k,v in data.items() if k != 'type'}
-                        self.socket.send_string(f"{topic} {json.dumps(pub_data)}")
-                        self.last_pub_time = now
-                        
-                        cls_name = CLS_MAP.get(pub_data['class_id'], "UNK")
-                        # 打印时显示更多调试信息
-                        print(f"👁️ [{cls_name}-{pub_data['cam_idx']}] "
-                              f"Fus:{pub_data['distance']} | "
-                              f"G:{pub_data['dist_geo']} W:{pub_data['dist_width']}")
+                # --- 2. 融合阶段 (Fusion) ---
+                final_objects = []
 
-                self.queue.task_done()
+                if batch_detections:
+                    # 调试：显示收集到的原始数据
+                    if len(batch_detections) > 1:
+                        raw_info = [f"Cam{d['cam_idx']}:{CLS_MAP.get(d['class_id'],'?')}@{d['bearing_body']:.0f}°"
+                                   for d in batch_detections]
+                        print(f"  🔍 收集到 {len(batch_detections)} 个检测: {raw_info}")
+
+                    # A. 排序：面积大的排前面 (相信看得最清楚的)
+                    #    被截断的物体降权处理
+                    def get_effective_area(obj):
+                        area = obj['area']
+                        if obj['truncated']:
+                            area *= 0.5  # 截断物体权重减半
+                        return area
+
+                    batch_detections.sort(key=get_effective_area, reverse=True)
+
+                    # B. 去重 (Suppression) - 仅基于角度
+                    for new_obj in batch_detections:
+                        is_duplicate = False
+                        duplicate_with = None
+                        angle_diff = 0.0
+
+                        for existing in final_objects:
+                            # 判断是否为同一物体：
+                            # 1. 类别必须相同
+                            if new_obj['class_id'] != existing['class_id']:
+                                continue
+
+                            # 2. 角度接近 (相差 < 100 度) - 只看角度
+                            angle_diff = get_angle_diff(new_obj['bearing_body'], existing['bearing_body'])
+
+                            if angle_diff < 100:
+                                is_duplicate = True
+                                duplicate_with = existing
+                                break
+
+                        if is_duplicate:
+                            # 调试：显示去重信息
+                            print(f"    ❌ 去重: Cam{new_obj['cam_idx']} 的 {CLS_MAP.get(new_obj['class_id'],'?')} "
+                                  f"与 Cam{duplicate_with['cam_idx']} 重复 (角度差={angle_diff:.1f}°)")
+                        else:
+                            final_objects.append(new_obj)
+
+                # --- 3. 发送阶段 (Publish) ---
+                # 将融合后的结果逐个发送
+                for obj in final_objects:
+                    topic = "perception"
+                    # 只发送下游需要的字段，移除 area/truncated 等中间变量
+                    pub_data = {
+                        'cam_idx': obj['cam_idx'], # 即使融合了，也告诉下游这数据主要来自哪个相机
+                        'class_id': obj['class_id'],
+                        'pattern': obj['pattern'],
+                        'distance': obj['distance'],
+                        'bearing_body': obj['bearing_body']
+                    }
+                    self.socket.send_string(f"{topic} {json.dumps(pub_data)}")
+
+                    # 单条打印：更清晰的输出格式
+                    cls_name = CLS_MAP.get(obj['class_id'], "UNK")
+                    print(f"👁️ [{cls_name}-Cam{obj['cam_idx']}] {obj['pattern']:<5} | D={obj['distance']:.2f}m | Ang={obj['bearing_body']:.1f}°")
+
+                # --- 4. 控频休眠 ---
+                elapsed = time.time() - cycle_start
+                sleep_time = fusion_interval - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
         except KeyboardInterrupt:
             print("🛑 停止中...")
-
-    def cleanup(self):
-        self.socket.close()
-        self.context.term()
+        finally:
+            self.socket.close()
+            self.context.term()
 
 if __name__ == "__main__":
     pub = VisionPublisher(MODEL_PATH, CAMERA_INDICES, ZMQ_PORT)
-    try:
-        pub.run()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        pub.cleanup()
+    pub.run()

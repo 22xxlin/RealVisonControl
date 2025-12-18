@@ -66,7 +66,7 @@ class Inference:
         }
 
         self.frame_width = 640
-        self.frame_height = 360  # 注意：内参通常对应特定分辨率，如果分辨率改变，内参需缩放
+        self.frame_height = 480  # 注意：内参通常对应特定分辨率，如果分辨率改变，内参需缩放
         self.camera_caps: List[cv2.VideoCapture] = []
         self.camera_threads: List[threading.Thread] = []
         self.camera_frames: Dict[int, np.ndarray] = {}
