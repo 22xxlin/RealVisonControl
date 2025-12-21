@@ -317,22 +317,39 @@ class VisionPublisher:
                             final_objects.append(new_obj)
 
                 # --- 3. 发送阶段 (Publish) ---
-                # 将融合后的结果逐个发送
+                # [Refactor] Changed to batch sending
+                # 构造包含所有物体的大字典 (Payload)
+                topic = "perception"
+                timestamp = time.time()
+
+                # 构建物体列表，只包含下游需要的字段
+                objects_list = []
                 for obj in final_objects:
-                    topic = "perception"
-                    # 只发送下游需要的字段，移除 area/truncated 等中间变量
-                    pub_data = {
-                        'cam_idx': obj['cam_idx'], # 即使融合了，也告诉下游这数据主要来自哪个相机
+                    obj_data = {
+                        'cam_idx': obj['cam_idx'],
                         'class_id': obj['class_id'],
                         'pattern': obj['pattern'],
                         'distance': obj['distance'],
                         'bearing_body': obj['bearing_body']
                     }
-                    self.socket.send_string(f"{topic} {json.dumps(pub_data)}")
+                    objects_list.append(obj_data)
 
-                    # 单条打印：更清晰的输出格式
-                    cls_name = CLS_MAP.get(obj['class_id'], "UNK")
-                    print(f"👁️ [{cls_name}-Cam{obj['cam_idx']}] {obj['pattern']:<5} | D={obj['distance']:.2f}m | Ang={obj['bearing_body']:.1f}°")
+                # 构造完整的 Payload
+                payload = {
+                    'timestamp': timestamp,
+                    'count': len(final_objects),
+                    'objects': objects_list
+                }
+
+                # [Refactor] 只发送一次，而不是遍历发送
+                self.socket.send_string(f"{topic} {json.dumps(payload)}")
+
+                # 打印发送的物体信息
+                if final_objects:
+                    print(f"📦 [Batch Send] 时间戳={timestamp:.3f} | 物体数={len(final_objects)}")
+                    for obj in final_objects:
+                        cls_name = CLS_MAP.get(obj['class_id'], "UNK")
+                        print(f"  👁️ [{cls_name}-Cam{obj['cam_idx']}] {obj['pattern']:<5} | D={obj['distance']:.2f}m | Ang={obj['bearing_body']:.1f}°")
 
                 # --- 4. 控频休眠 ---
                 elapsed = time.time() - cycle_start
