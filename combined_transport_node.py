@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-combined_transport_node_v3_4.py
-[Bug修复版]
-1. 修复 NoneType 比较错误：.get('conf', 1.0)
-2. 包含 V3.3 的所有功能 (协议对接 + 高精度控制)
+combined_transport_node_v3_6.py
+[最终修复版]
+1. 导航逻辑：基于最小代价(Cost-based)自动选择 +120° 或 -120°。
+2. 防抖动：增加了 Side Selection Hysteresis (选边迟滞)，防止在 180° 处震荡。
+3. 系统稳定性：保留了之前的 NoneType 检查和 Stall 检测。
 """
 
 import argparse
@@ -17,11 +18,12 @@ import zmq
 import numpy as np
 from collections import defaultdict, deque
 
+# 确保这两个文件在同一目录下
 from light_driver import LightDriver
 from robot_driver import RobotDriver
 
 # ==========================================
-# 1. 核心参数
+# 1. 核心参数配置
 # ==========================================
 BLUE, RED, GREEN, PURPLE, GRAY = 1, 2, 3, 4, 5
 BALL_CLASS_ID = 6
@@ -31,7 +33,7 @@ FORMATION_ANGLE_DIFF = 120.0
 TARGET_DIST = 0.25
 BLIND_APPROACH_LIMIT = 0.8 
 
-# 死区 & PID (高精度版)
+# PID & 死区控制
 DIST_DEADBAND_ENTER = 0.015
 DIST_DEADBAND_EXIT  = 0.035
 DIST_SOFT_ZONE      = 0.08   
@@ -40,16 +42,21 @@ KP_DIST_SLOW = 0.20
 KP_THETA     = 0.80
 FRICTION_FEEDFORWARD = 0.02 
 
-LOCK_TIME_THRESHOLD = 1.0  
+# 锁定与防堵转
+LOCK_TIME_THRESHOLD = 0.8 
 STALL_CHECK_WINDOW   = 0.30
 STALL_VEL_THRESHOLD  = 0.02
 CMD_EFFORT_THRESHOLD = 0.002
 STALL_TRIGGER_TIME   = 1.0
 
+# 迟滞参数 (关键)
+SIDE_HYSTERESIS_BIAS = 0.25  # 约14度，用于选边防抖
+
 def mono() -> float:
     return time.monotonic()
 
 def wrap_rad_pi(a):
+    """归一化到 [-pi, pi]"""
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 def heading_to_vxy(speed: float, heading_deg: float):
@@ -61,34 +68,42 @@ def log(msg: str):
     print(f"[{ts}] {msg}", flush=True)
 
 # ==========================================
-# 2. 辅助类 (KF & Stall)
+# 2. 辅助类 (Stall & KF)
 # ==========================================
 class StallDetector:
     def __init__(self):
         self.history = collections.deque(maxlen=50)
         self.stall_start_time = None
         self.is_stalled = False
+    
     def update(self, rel_x, rel_y, cmd_effort):
         now = mono()
         self.history.append((now, rel_x, rel_y))
+        
         past_record = None
         for record in self.history:
             if now - record[0] >= STALL_CHECK_WINDOW:
                 past_record = record
                 break
+        
         if past_record is None: return False
+        
         dt = now - past_record[0]
         if dt < 1e-3: return False
+        
         dx = rel_x - past_record[1]
         dy = rel_y - past_record[2]
         real_vel = math.hypot(dx, dy) / dt
+        
         is_stucking = (cmd_effort > CMD_EFFORT_THRESHOLD) and (real_vel < STALL_VEL_THRESHOLD)
+        
         if is_stucking:
             if self.stall_start_time is None: self.stall_start_time = now
             elif now - self.stall_start_time > STALL_TRIGGER_TIME: self.is_stalled = True
         else:
             self.stall_start_time = None
             self.is_stalled = False
+            
         return self.is_stalled
 
 class BodyFrameKF:
@@ -101,24 +116,31 @@ class BodyFrameKF:
         self.last_r = None
         self.reject_count = 0 
         self.MAX_REJECT = 8
+        
     def predict(self, now):
         if self.x is None: return
         dt = now - self.last_update_time
         if dt < 0: dt = 0
         self.last_update_time = now
         self.P += self.Q_base * (dt * 10.0)
+        
     def update(self, distance, bearing_deg, conf=1.0, truncated=False):
         now = mono()
         self.predict(now)
         b_rad = math.radians(bearing_deg)
+        
         if truncated and self.last_r is not None: meas_dist = self.last_r
         else: meas_dist = distance
+        
         z = np.array([meas_dist * math.cos(b_rad), meas_dist * math.sin(b_rad)])
+        
         if self.x is None:
             self.x = z
             self.P = np.eye(2) * 0.5
             self.last_r = distance
             return
+            
+        # Gating 防突变
         if self.last_r is not None and self.last_r < 0.5:
              dist_diff = np.linalg.norm(z - self.x)
              if dist_diff > 0.4:
@@ -126,10 +148,12 @@ class BodyFrameKF:
                  if self.reject_count < self.MAX_REJECT: return 
              else:
                  self.reject_count = 0
+                 
         r_sigma = 0.05 
         if truncated: r_sigma *= 10.0
         if conf < 0.8: r_sigma *= 2.0
         R = np.eye(2) * (r_sigma ** 2)
+        
         try:
             y = z - self.x
             S = self.P + R
@@ -137,14 +161,16 @@ class BodyFrameKF:
             self.x = self.x + K @ y
             self.P = (np.eye(2) - K) @ self.P
         except: pass
+        
         if not truncated: self.last_r = math.hypot(self.x[0], self.x[1])
+        
     def get_state(self):
         if self.x is None: return None
         if mono() - self.last_update_time > 1.0: return None
         return float(self.x[0]), float(self.x[1])
 
 # ==========================================
-# 3. 入位驾驶仪 (FormationPilot)
+# 3. 入位驾驶仪 (FormationPilot) - 核心逻辑修复
 # ==========================================
 class FormationPilot:
     def __init__(self, driver: RobotDriver):
@@ -155,7 +181,7 @@ class FormationPilot:
         
         self.stable_since = None
         self.is_in_deadband = False
-        self.latest_side_intent = None 
+        self.latest_side_intent = None  # [新增] 记录选边意图
         self.last_debug_err = (0.0, 0.0)
         self.mode_tag = "INIT"
 
@@ -164,7 +190,6 @@ class FormationPilot:
         raw_ball = self._select_best(vision_batch, BALL_CLASS_ID)
         raw_leader = self._select_best(vision_batch, LEADER_CLASS_ID, "SOLID")
         
-        # [修复] 增加默认值，防止 NoneType 错误
         if raw_ball: 
             self.kf_ball.update(raw_ball['distance'], raw_ball['bearing_body'], 
                                 raw_ball.get('conf', 1.0), raw_ball.get('truncated', False))
@@ -204,52 +229,80 @@ class FormationPilot:
         self.is_in_deadband = abs(dist_err) < deadband
 
         v_tan, angle_err_deg, side_char = 0.0, 0.0, "?"
+        
         if is_virtual_ball:
             pass # 虚拟球不选边
         else:
-            # 自动择优
+            # ==========================================
+            # [核心修复] 智能择优 & 迟滞逻辑
+            # ==========================================
             theta_leader = math.atan2(yl - yt, xl - xt)
-            diff_rad = math.radians(FORMATION_ANGLE_DIFF)
-            err_pos = wrap_rad_pi((theta_leader + diff_rad) - theta_robot)
-            err_neg = wrap_rad_pi((theta_leader - diff_rad) - theta_robot)
-
-            if abs(err_pos) < abs(err_neg): final_err_rad, side_char = err_pos, "+"
-            else: final_err_rad, side_char = err_neg, "-"
+            diff_rad = math.radians(FORMATION_ANGLE_DIFF) # 120度
             
-            # 记录意图
-            self.latest_side_intent = side_char 
+            # 1. 计算两个候选点的角度误差
+            err_pos = wrap_rad_pi((theta_leader + diff_rad) - theta_robot) # 对应 +120 (左)
+            err_neg = wrap_rad_pi((theta_leader - diff_rad) - theta_robot) # 对应 -120 (右)
+
+            # 2. 计算基础代价 (距离/角度差绝对值)
+            cost_pos = abs(err_pos)
+            cost_neg = abs(err_neg)
+
+            # 3. [迟滞] 偏向保持之前的选择
+            if self.latest_side_intent == "+":
+                cost_pos -= SIDE_HYSTERESIS_BIAS
+            elif self.latest_side_intent == "-":
+                cost_neg -= SIDE_HYSTERESIS_BIAS
+
+            # 4. 择优
+            if cost_pos < cost_neg:
+                final_err_rad, side_char = err_pos, "+"
+            else:
+                final_err_rad, side_char = err_neg, "-"
+
+            # 5. 更新意图
+            self.latest_side_intent = side_char
 
             angle_err_deg = math.degrees(final_err_rad)
-            if self.is_in_deadband and abs(angle_err_deg) < 5.0: v_tan = 0.0
-            else: v_tan = max(-0.3, min(0.3, KP_THETA * final_err_rad * curr_dist))
+            
+            # 切向控制 (PID)
+            if self.is_in_deadband and abs(angle_err_deg) < 5.0: 
+                v_tan = 0.0
+            else: 
+                v_tan = max(-0.3, min(0.3, KP_THETA * final_err_rad * curr_dist))
+            # ==========================================
 
         self.last_debug_err = (dist_err, angle_err_deg)
 
-        # 径向控制
+        # 4. 径向控制
         v_rad = 0.0
         if not self.is_in_deadband:
             if abs(dist_err) < DIST_SOFT_ZONE:
                 v_rad = -KP_DIST_SLOW * dist_err
+                # 摩擦前馈
                 if abs(v_rad) > 0.001: v_rad += math.copysign(FRICTION_FEEDFORWARD, v_rad)
             else:
                 v_rad = -KP_DIST_FAST * dist_err
             
+            # 堵转保护
             check_effort = abs(v_rad) if v_rad < 0 else 0.0
             if self.stall_detector.update(xt, yt, check_effort) and v_rad < 0:
                 v_rad = 0.0
                 self.mode_tag = "STALL"
 
         v_rad = max(-0.25, min(0.25, v_rad))
+        
+        # 5. 速度合成
         th = theta_robot
         vx = v_rad * math.cos(th) - v_tan * math.sin(th)
         vy = v_rad * math.sin(th) + v_tan * math.cos(th)
 
-        if curr_dist < 0.15: # Escape
+        # 穿模保护 (距离过近逃逸)
+        if curr_dist < 0.15: 
             vx, vy = 0.1 * math.cos(th), 0.1 * math.sin(th)
 
         self.driver.send_velocity_command(vx, vy, 0.0)
 
-        # 4. 判定锁定
+        # 6. 判定锁定状态
         is_pos_stable = (not is_virtual_ball) and self.is_in_deadband and (abs(angle_err_deg) < 5.0)
         
         if is_pos_stable:
@@ -394,16 +447,13 @@ def main():
                     light.set_cmd("OFF")
 
             elif state == "WAIT_GO_SIGNAL":
-                # 维持灯光
-                if my_side == "left": light.set_cmd("LOCK_LEFT")
-                else: light.set_cmd("LOCK_RIGHT")
-
+                # 灯光已在 LOCKED 时设置，等待 GO 信号
                 if watcher.stable_pattern(PURPLE, "SOLID", 3, 0.4):
                     state = "ARMED"
-                    light.set_cmd("FOLLOWER_PUSH") 
+                    light.set_cmd("FOLLOWER_PUSH")  # 变灰常亮
                     armed = True
                     t_armed_start = mono() + args.delay
-                    log(f"收到 GO 信号，{args.delay}s 后启动")
+                    log(f"收到 GO 信号 (紫常亮)，{args.delay}s 后启动")
                 
             elif state == "WAIT_FORM":
                 left_ready = watcher.stable_pattern(GREEN, "SOLID", 3, 0.6)
