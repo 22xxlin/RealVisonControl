@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 文件: control_sub.py
-版本: 编队调试专用版 (Formation Debug Mode)
+版本: 编队调试专用版 (Formation Debug Mode) - Update 1
 功能: 
   1. 专注于调试 "Search -> Discover -> Form Triangle" 流程。
   2. 🚫 禁用了所有 "搬运 (Transport)" 相关的状态跳转。
   3. ✅ 当队形组建完成后，所有车会保持静止并亮灯，方便拍照/测量。
+  4. 🔄 更新了搜索阶段的散开方向 (13横/10后/15前)。
 """
 
 import zmq
@@ -68,14 +69,14 @@ class SwarmController:
         self.state = "INIT"
         self.my_role = "SEARCHER" 
         
-        # === 角色分配 ===
+        # === 角色分配 (注意：这里定义的是变成 Follower 后的目标位置) ===
         if self.ROBOT_ID == 10:
             self.target_slot_angle = -120.0 
             self.slot_name = "LEFT (-120)"
         elif self.ROBOT_ID == 13:
             self.target_slot_angle = 120.0
             self.slot_name = "RIGHT (+120)"
-        else:
+        else: # ID 15
             self.target_slot_angle = 120.0
             self.slot_name = "RIGHT (+120)"
 
@@ -174,23 +175,13 @@ class SwarmController:
                         
                         if is_left_ready and is_right_ready:
                             print("🎉🎉🎉 [SUCCESS] 编队组建完成！所有单位就位！ 🎉🎉🎉")
-                            # 可以在这里让 Leader 闪烁庆祝一下，或者保持静止
                         elif is_left_ready:
                             print("⏳ 左侧就位... 等待右侧")
                         elif is_right_ready:
                             print("⏳ 右侧就位... 等待左侧")
-                            
-                        # 🚫 屏蔽跳转
-                        # if ...: self.update_state("TRANSPORT_LEADER")
-
-                    # 🚫 屏蔽搬运逻辑
-                    # elif self.state == "TRANSPORT_LEADER": ...
 
                 # --- C. 队员 (FOLLOWER) ---
                 elif self.my_role == "FOLLOWER":
-                    # 🚫 屏蔽收到紫色灯的搬运指令
-                    # if class_id == CLS_PURPLE: ...
-                    
                     if class_id == CLS_RED:
                         self.maintain_formation(dist, bearing)
                     else:
@@ -207,16 +198,29 @@ class SwarmController:
         self.driver.stop()
 
     def omni_search_move(self):
-        """扇形展开 + S形平推"""
+        """
+        扇形展开 + S形平推
+        修改: 13横侧 / 10向后 / 15向前
+        """
         elapsed = time.time() - self.start_time
         vx, vy = 0.0, 0.0
+        
+        # === 第一阶段：散开 (Disperse) ===
         if elapsed < self.DISPERSE_TIME:
-            if self.ROBOT_ID == 10:   vx = self.SEARCH_SPEED
-            elif self.ROBOT_ID == 13: vx = -self.SEARCH_SPEED
-            else:                     vy = -self.SEARCH_SPEED
+            if self.ROBOT_ID == 13:
+                # 13号: 向横侧 (左)
+                vy = self.SEARCH_SPEED 
+            elif self.ROBOT_ID == 10:
+                # 10号: 向后 (vx < 0)
+                vx = -self.SEARCH_SPEED
+            elif self.ROBOT_ID == 15:
+                # 15号: 向前 (vx > 0)
+                vx = self.SEARCH_SPEED
+        # === 第二阶段：S形搜索 ===
         else:
             vy = -self.SEARCH_SPEED 
             vx = 0.15 * math.sin(elapsed * math.pi)
+            
         self.driver.send_velocity_command(vx, vy, 0.0)
 
     def move_to_ball(self, dist, bearing):
@@ -244,15 +248,14 @@ class SwarmController:
         v_y = bearing_err * 0.015
         v_y = max(-0.2, min(0.2, v_y))
         
-        # 3. 判定是否就位 (阈值要调好，太严很难READY，太松队形不准)
-        # 距离误差 < 15cm, 角度误差 < 15度
+        # 3. 判定是否就位
         if abs(dist_err) < 0.15 and abs(bearing_err) < 15.0:
             self.update_state("READY")
             # ⚠️ 调试核心: 一旦 READY，强制停车，防止在临界点抖动
             self.driver.stop() 
         else:
             self.update_state("BIDDING")
-            self.driver.send_velocity_command(v_x, v_y, 0.0) # 只有没就位才动
+            self.driver.send_velocity_command(v_x, v_y, 0.0)
 
     def move_towards_flag(self, bearing):
         pass # Debug模式下禁用
