@@ -69,7 +69,7 @@ class Inference:
 
         # Multi-camera support attributes
         self.num_cameras = 4
-        self.camera_indices = [0, 2, 4, 6]
+        self.camera_indices = [ 2, 4, 6]
         
         # 相机安装朝向偏移 (机体坐标系)
         self.camera_yaw_offsets = {
