@@ -1,96 +1,80 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-test_formation_lock_vision_ekf.py
-
-融合版 V2.4 (Batch适配 + 平移脱困):
-- [新增] 平移脱困逻辑: 检测到堵转时，暂停PID，强制执行 "后退+横移" 1.5秒。
-- [保留] VisionSubscriber: 适配 vision_pub.py V3.2 Batch 协议。
-- [保留] 自动择优 + 迟滞锁定。
+文件: full_mission_controller.py
+版本: Merged_With_V2.6_Test_Logic
+功能: Long-Horizon 全流程控制 (集成 V2.6 平移锁定逻辑)
+说明: 
+  - 已用 test_formation_lock_vision_ekf.py 的核心算法替换了 FormationPilot
+  - 包含了 Tracking -> Sliding (0.2m) -> Finished 的完整流程
 """
 
-import rospy
-import math
-import time
-import collections
 import zmq
 import json
+import math
+import sys
+import time
+import argparse
+import rospy
+import collections
 import numpy as np
-from robot_driver import RobotDriver
+from collections import deque, defaultdict
 
-# =========================
-# 1. 核心配置
-# =========================
-ROBOT_ID = 15
+# 检查 ROS 是否初始化
+if not rospy.core.is_initialized():
+    rospy.init_node('swarm_mission_node', anonymous=True, disable_signals=True)
 
-# 视觉 ZMQ
-ZMQ_IP   = "127.0.0.1"
-ZMQ_PORT = 5555
-ZMQ_TOPIC = "perception"
+try:
+    from robot_driver import RobotDriver
+    from light_driver import LightDriver
+except ImportError:
+    print("❌ 错误: 找不到驱动文件 (robot_driver.py / light_driver.py)")
+    pass 
 
-# 目标定义
-BALL_CLASS_ID = 6
-LEADER_CLASS_ID = 2
-LEADER_PATTERN = "SOLID"
+# ================= 1. 全局配置常量 =================
+CLS_BLUE   = 1
+CLS_RED    = 2
+CLS_GREEN  = 3
+CLS_PURPLE = 4
+CLS_GRAY   = 5
+CLS_BALL   = 6
 
-# 队形参数
-FORMATION_ANGLE_DIFF = 120.0  # 绝对值，程序会自动选择 +120 或 -120
-TARGET_DIST = 0.25
-BLIND_APPROACH_LIMIT = 0.8 
+# 任务参数
+TRANSPORT_SPEED = 0.15      
+TRANSPORT_DURATION = 8.0    
+START_DELAY = 1.2           
 
-# PID 参数
-DIST_DEADBAND_ENTER = 0.015  # 进入静止
-DIST_DEADBAND_EXIT  = 0.035  # 离开静止
+# 工具函数
+def mono(): return time.monotonic()
+def normalize_angle(angle): return (angle + 180) % 360 - 180
+def wrap_rad_pi(a): return (a + math.pi) % (2.0 * math.pi) - math.pi
+def wrap_deg_180(a): return (a + 180.0) % 360.0 - 180.0
 
-DIST_SOFT_ZONE = 0.08
-KP_DIST_FAST = 0.35
-KP_DIST_SLOW = 0.20
-KP_THETA     = 0.80
+# ================= 2. 核心算法类 (来自 test_formation_lock_vision_ekf.py) =================
 
-# 堵转检测
-STALL_CHECK_WINDOW   = 0.30
-STALL_VEL_THRESHOLD  = 0.02
-CMD_EFFORT_THRESHOLD = 0.002
-STALL_TRIGGER_TIME   = 1.0
-FRICTION_FEEDFORWARD = 0.02
-
-# 脱困参数
-ESCAPE_DISTANCE = 0.30      # 脱困平移距离 (米)
-ESCAPE_SPEED_Y  = 0.20      # 脱困横移速度 (m/s)
-ESCAPE_SPEED_X  = -0.05     # 脱困后退速度 (m/s, 稍微后退以释放压力)
-# 计算脱困所需时间: t = d / v
-ESCAPE_DURATION = ESCAPE_DISTANCE / ESCAPE_SPEED_Y
-
-# =========================
-# 2. 辅助工具
-# =========================
-def wrap_rad_pi(a):
-    """将弧度归一化到 [-pi, pi]"""
-    return (a + math.pi) % (2.0 * math.pi) - math.pi
-
-def wrap_deg_180(a):
-    """将角度归一化到 [-180, 180]"""
-    return (a + 180.0) % 360.0 - 180.0
-
-# =========================
-# 3. 堵转检测
-# =========================
 class StallDetector:
+    """堵转检测器 (V2.6版)"""
     def __init__(self):
         self.history = collections.deque(maxlen=50)
         self.stall_start_time = None
         self.is_stalled = False
+        
+        # 参数
+        self.STALL_CHECK_WINDOW   = 0.30
+        self.STALL_VEL_THRESHOLD  = 0.02
+        self.CMD_EFFORT_THRESHOLD = 0.002
+        self.STALL_TRIGGER_TIME   = 1.0
 
     def update(self, rel_x, rel_y, cmd_effort):
-        now = time.time()
+        now = mono()
         self.history.append((now, rel_x, rel_y))
 
         past_record = None
         for record in self.history:
-            if now - record[0] >= STALL_CHECK_WINDOW:
+            if now - record[0] >= self.STALL_CHECK_WINDOW:
                 past_record = record
                 break
-        
+
         if past_record is None:
             return False, 0.0
 
@@ -101,12 +85,12 @@ class StallDetector:
         dy = rel_y - past_record[2]
         real_vel = math.hypot(dx, dy) / dt
 
-        is_stucking = (cmd_effort > CMD_EFFORT_THRESHOLD) and (real_vel < STALL_VEL_THRESHOLD)
+        is_stucking = (cmd_effort > self.CMD_EFFORT_THRESHOLD) and (real_vel < self.STALL_VEL_THRESHOLD)
 
         if is_stucking:
             if self.stall_start_time is None:
                 self.stall_start_time = now
-            elif now - self.stall_start_time > STALL_TRIGGER_TIME:
+            elif now - self.stall_start_time > self.STALL_TRIGGER_TIME:
                 self.is_stalled = True
         else:
             self.stall_start_time = None
@@ -114,36 +98,28 @@ class StallDetector:
 
         return self.is_stalled, real_vel
 
-    def reset(self):
-        """重置检测器状态 (脱困后调用)"""
-        self.history.clear()
-        self.stall_start_time = None
-        self.is_stalled = False
-
-# =========================
-# 4. Body Frame KF
-# =========================
 class BodyFrameKF:
+    """卡尔曼滤波器 (V2.6版 - 带拒绝突变逻辑)"""
     def __init__(self, name="target"):
         self.name = name
-        self.x = None 
+        self.x = None
         self.P = np.eye(2) * 1.0
-        self.Q_base = np.eye(2) * 0.01 
-        self.last_update_time = time.time()
-        self.last_r = None 
-        self.reject_count = 0 
+        self.Q_base = np.eye(2) * 0.01
+        self.last_update_time = mono()
+        self.last_r = None
+        self.reject_count = 0
         self.MAX_REJECT = 8
 
-    def predict(self, now):
+    def predict(self, now, ego_vx=0.0, ego_vy=0.0, ego_w=0.0):
         if self.x is None: return
         dt = now - self.last_update_time
-        if dt < 0: dt = 0
+        if dt < 1e-6: return
         self.last_update_time = now
         self.P += self.Q_base * (dt * 10.0)
 
-    def update(self, distance, bearing_deg, conf=1.0, truncated=False):
-        now = time.time()
-        self.predict(now)
+    def update(self, distance, bearing_deg, ego_vx=0.0, ego_vy=0.0, ego_w=0.0, conf=1.0, truncated=False):
+        now = mono()
+        self.predict(now, ego_vx, ego_vy, ego_w)
 
         b_rad = math.radians(bearing_deg)
         if truncated and self.last_r is not None:
@@ -159,17 +135,17 @@ class BodyFrameKF:
             self.last_r = distance
             return
 
-        # Gating
+        # 拒绝突变逻辑
         if self.last_r is not None and self.last_r < 0.5:
              dist_diff = np.linalg.norm(z - self.x)
-             if dist_diff > 0.4 and self.reject_count < self.MAX_REJECT:
-                 print(f"🛡️ [{self.name}] 拒绝突变: {dist_diff:.2f}m")
+             if dist_diff > 0.4 and self.reject_count < self.MAX_REJECT and not truncated:
+                 # print(f"🛡️ [{self.name}] 拒绝突变: {dist_diff:.2f}m")
                  self.reject_count += 1
                  return
         self.reject_count = 0
 
-        r_sigma = 0.05 
-        if truncated: r_sigma *= 10.0
+        r_sigma = 0.05
+        if truncated: r_sigma = 1.0 
         if conf < 0.8: r_sigma *= 2.0
         R = np.eye(2) * (r_sigma ** 2)
 
@@ -190,260 +166,494 @@ class BodyFrameKF:
         if self.x is None: return None
         return float(self.x[0]), float(self.x[1])
 
-# =========================
-# 5. 视觉通信
-# =========================
-class VisionSubscriber:
-    def __init__(self, ip, port, topic):
-        self.ctx = zmq.Context()
-        self.sub = self.ctx.socket(zmq.SUB)
-        self.sub.connect(f"tcp://{ip}:{port}")
-        self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
-        self.sub.setsockopt(zmq.CONFLATE, 0) 
-    
-    def poll_batch(self):
-        """接收并解析 Batch 数据"""
-        batch = []
-        try:
-            while True:
-                if self.sub.poll(0) == 0: break
-                msg = self.sub.recv_string(flags=zmq.NOBLOCK)
-                _, payload = msg.split(" ", 1)
-                data = json.loads(payload)
-                
-                if 'objects' in data and isinstance(data['objects'], list):
-                    batch.extend(data['objects'])
-                elif isinstance(data, dict) and 'class_id' in data:
-                    batch.append(data)
-        except Exception: pass
-        return batch
-
-    def select_best(self, batch, cls_id, pattern=None):
-        candidates = [m for m in batch if m.get('class_id') == cls_id]
-        if pattern:
-            candidates = [m for m in candidates if m.get('pattern') == pattern]
-        if not candidates: return None
-        # 直接信任发布端的排序（面积优先）
-        return candidates[0]
-
-# =========================
-# 6. 控制器 (V2.4: 自动择优 + 迟滞 + 脱困)
-# =========================
-class FormationController:
-    def __init__(self):
-        rospy.init_node('formation_lock_vision_body', anonymous=True)
-        self.driver = RobotDriver(ROBOT_ID)
-        self.vision = VisionSubscriber(ZMQ_IP, ZMQ_PORT, ZMQ_TOPIC)
+class FormationPilot:
+    """
+    智能飞行员 (移植自 test_formation_lock_vision_ekf.py V2.6)
+    包含: Tracking -> Sliding -> Finished 状态机
+    """
+    def __init__(self, driver):
+        self.driver = driver
         self.stall_detector = StallDetector()
-        
+
         self.kf_ball = BodyFrameKF("Ball")
         self.kf_leader = BodyFrameKF("Leader")
 
-        self.ctx_pub = zmq.Context()
-        self.pub_sock = self.ctx_pub.socket(zmq.PUB)
-        self.pub_sock.bind("tcp://*:5556")
-        self.rate = rospy.Rate(30)
+        # 状态记录
+        self.last_cmd_vx = 0.0
+        self.last_cmd_vy = 0.0
+        self.last_cmd_w  = 0.0
+        self.latest_side_intent = None
+        self.mode_tag = "INIT"
+        self.last_debug_err = (0.0, 0.0)
 
-        self.is_done_state = False
+        # === 任务阶段控制 ===
+        # PHASES: "TRACKING" -> "SLIDING" -> "FINISHED"
+        self.mission_phase = "TRACKING"
+        self.slide_start_time = None
+        self.is_done_state = False # 用于Tracking内部判断是否进入死区
 
-        # --- 脱困状态变量 ---
-        self.unstuck_mode = False
-        self.unstuck_start_time = 0.0
-        self.unstuck_direction = 1.0  # 1.0=左, -1.0=右
+        # === PID & 逻辑参数 ===
+        self.FORMATION_ANGLE_DIFF = 120.0
+        self.TARGET_DIST = 0.25
+        self.BLIND_APPROACH_LIMIT = 0.8
+        self.SIDE_HYSTERESIS_BIAS = 0.25
 
-    def run(self):
-        print(f"🚀 V2.4 脱困增强版 | 目标: ±{FORMATION_ANGLE_DIFF}° | 脱困: 平移{ESCAPE_DISTANCE}m")
+        self.DIST_DEADBAND_ENTER = 0.015
+        self.DIST_SOFT_ZONE = 0.08
+        self.KP_DIST_FAST = 0.20
+        self.KP_DIST_SLOW = 0.10
+        self.KP_THETA     = 0.80
+        self.FRICTION_FEEDFORWARD = 0.02
+
+        # 平移任务参数
+        self.SLIDE_VEL_ABS = 0.1   # m/s
+        self.SLIDE_DIST    = 0.2   # m
+        self.SLIDE_DURATION = self.SLIDE_DIST / self.SLIDE_VEL_ABS # 2.0s
+        self.slide_vel_y_cmd = -0.1
+
+    def update(self, batch):
+        """
+        每帧调用。
+        返回状态字符串: "ADJUSTING", "SLIDING", "LOCKED_LEFT", "LOCKED_RIGHT"
+        """
+        # 1. 始终运行 EKF
+        raw_ball = self._select_best(batch, CLS_BALL)
+        raw_leader = self._select_best(batch, CLS_RED, "SOLID")
+
+        now = mono()
         
-        while not rospy.is_shutdown():
-            batch = self.vision.poll_batch()
-            raw_ball = self.vision.select_best(batch, BALL_CLASS_ID)
-            raw_leader = self.vision.select_best(batch, LEADER_CLASS_ID, LEADER_PATTERN)
+        if raw_ball:
+            self.kf_ball.update(raw_ball['distance'], raw_ball['bearing_body'],
+                self.last_cmd_vx, self.last_cmd_vy, self.last_cmd_w,
+                raw_ball.get('conf', 1.0), raw_ball.get('truncated', False))
+        else:
+            self.kf_ball.predict(now, self.last_cmd_vx, self.last_cmd_vy, self.last_cmd_w)
 
-            if raw_ball:
-                self.kf_ball.update(raw_ball['distance'], raw_ball['bearing_body'], 
-                                    raw_ball.get('conf', 1.0), raw_ball.get('truncated', False))
-            if raw_leader:
-                self.kf_leader.update(raw_leader['distance'], raw_leader['bearing_body'],
-                                      raw_leader.get('conf', 1.0), raw_leader.get('truncated', False))
+        if raw_leader:
+            self.kf_leader.update(raw_leader['distance'], raw_leader['bearing_body'],
+                self.last_cmd_vx, self.last_cmd_vy, self.last_cmd_w,
+                raw_leader.get('conf', 1.0), raw_leader.get('truncated', False))
+        else:
+            self.kf_leader.predict(now, self.last_cmd_vx, self.last_cmd_vy, self.last_cmd_w)
 
-            state_ball = self.kf_ball.get_state()
-            state_leader = self.kf_leader.get_state()
-            
+        state_ball = self.kf_ball.get_state()
+        state_leader = self.kf_leader.get_state()
+
+        vx, vy = 0.0, 0.0
+        current_status = "ADJUSTING"
+
+        # 2. 状态机逻辑
+        if self.mission_phase == "TRACKING":
+            # === 阶段1：视觉锁定 ===
+            is_tracking_finished = False
             valid_control = False
             control_ball = None
             is_virtual_ball = False
 
             if state_leader:
                 dist_leader = math.hypot(state_leader[0], state_leader[1])
-                if dist_leader > BLIND_APPROACH_LIMIT:
+                if dist_leader > self.BLIND_APPROACH_LIMIT:
                     if state_ball:
                         control_ball = state_ball
                         is_virtual_ball = False
+                        self.mode_tag = "FAR_BALL"
                     else:
-                        control_ball = state_leader 
-                        is_virtual_ball = True      
+                        control_ball = state_leader
+                        is_virtual_ball = True # 盲追
+                        self.mode_tag = "FAR_VIRT"
                     valid_control = True
                 else:
                     if state_ball:
                         control_ball = state_ball
                         is_virtual_ball = False
+                        self.mode_tag = "NEAR_BALL"
                         valid_control = True
                     else:
-                        valid_control = False
+                        self.mode_tag = "NEAR_LOST"
+                        valid_control = False # 有Leader没球且近，不盲动
             else:
-                valid_control = False
+                self.mode_tag = "NO_LEADER"
 
-            now = time.time()
-            if (now - self.kf_leader.last_update_time > 1.0):
+            # 保护: Leader 数据太旧
+            if (mono() - self.kf_leader.last_update_time > 1.0):
                 valid_control = False
 
             if valid_control and control_ball and state_leader:
-                self._control_loop(control_ball, state_leader, is_virtual_ball)
-                self._publish_debug(control_ball, state_leader)
+                # 计算控制量
+                vx, vy, is_tracking_finished = self._control_loop(control_ball, state_leader, is_virtual_ball)
+                
+                # 穿模保护
+                curr_dist = math.hypot(control_ball[0], control_ball[1])
+                if curr_dist < 0.18:
+                    theta_robot = math.atan2(-control_ball[1], -control_ball[0])
+                    vx = 0.15 * math.cos(theta_robot)
+                    vy = 0.15 * math.sin(theta_robot)
+                    is_tracking_finished = False
+                    # print(f"⚠️ 穿模保护: {curr_dist:.2f}m")
             else:
-                self.driver.stop()
-                self.is_done_state = False 
-                # 如果丢失目标，也要重置脱困状态，防止下次直接触发
-                self.unstuck_mode = False
+                vx, vy = 0.0, 0.0
+            
+            # [状态转换] Tracking -> Sliding
+            if is_tracking_finished:
+                print(f"✅ 视觉锁定完成。切换至开环平移模式 (Sliding)... Side: {self.latest_side_intent}")
+                self.mission_phase = "SLIDING"
+                self.slide_start_time = mono()
+                vx, vy = 0.0, 0.0
+            
+            current_status = "ADJUSTING"
 
-            self.rate.sleep()
+        elif self.mission_phase == "SLIDING":
+            # === 阶段2：开环平移 ===
+            vx = 0.0
+            vy = self.slide_vel_y_cmd
+
+            elapsed = mono() - self.slide_start_time
+            if elapsed >= self.SLIDE_DURATION:
+                print("✅ 平移完成。")
+                self.mission_phase = "FINISHED"
+                vx, vy = 0.0, 0.0
+            else:
+                self.mode_tag = "SLIDING"
+
+            current_status = "SLIDING"
+
+        elif self.mission_phase == "FINISHED":
+            # === 阶段3：结束/保持 ===
+            vx, vy = 0.0, 0.0
+            self.driver.stop()
+            # 根据最后一次意图返回状态
+            if self.latest_side_intent == "+":
+                current_status = "LOCKED_LEFT"
+            else:
+                current_status = "LOCKED_RIGHT"
+
+        # 3. 发送指令
+        if self.driver:
+            self.driver.send_velocity_command(vx, vy, 0.0)
+        
+        self.last_cmd_vx = vx
+        self.last_cmd_vy = vy
+        
+        return current_status
 
     def _control_loop(self, p_ball, p_leader, is_virtual):
-        # === [新增] 0. 脱困模式 (最高优先级) ===
-        if self.unstuck_mode:
-            elapsed = time.time() - self.unstuck_start_time
-            
-            if elapsed < ESCAPE_DURATION:
-                # 执行动作：稍微后退 + 横向平移
-                # ESCAPE_SPEED_Y * direction (1.0 for Left, -1.0 for Right)
-                cmd_vx = ESCAPE_SPEED_X 
-                cmd_vy = ESCAPE_SPEED_Y * self.unstuck_direction
-                
-                self.driver.send_velocity_command(cmd_vx, cmd_vy, 0.0)
-                # 降频打印
-                if int(elapsed * 10) % 5 == 0:
-                    dir_str = "LEFT" if self.unstuck_direction > 0 else "RIGHT"
-                    print(f"⚠️ [UNSTUCK] 堵转脱困中({dir_str})... {elapsed:.1f}s / {ESCAPE_DURATION:.1f}s")
-                return # 🚨 关键：直接返回，跳过 PID 计算
-            else:
-                # 时间到，退出脱困模式
-                self.unstuck_mode = False
-                self.stall_detector.reset() # 清空历史，防止连击
-                self.driver.stop() # 先停一下
-                print("✅ [UNSTUCK] 脱困完成，恢复控制")
-                # 继续往下执行 PID
-
-        # === 正常的 PID 控制逻辑 ===
+        """
+        核心控制算法 (来自 combined_transport_node_v5_hybrid.py V2.6)
+        返回值: (vx, vy, is_finished)
+        """
         xt, yt = p_ball
         xl, yl = p_leader
 
         theta_robot = math.atan2(-yt, -xt)
         curr_dist = math.hypot(xt, yt)
-        dist_err = curr_dist - TARGET_DIST
-        abs_err = abs(dist_err)
+        dist_err = curr_dist - self.TARGET_DIST
 
-        if self.is_done_state:
-            if abs_err > DIST_DEADBAND_EXIT: self.is_done_state = False
-        else:
-            if abs_err < DIST_DEADBAND_ENTER: self.is_done_state = True
+        # 调试信息更新
+        angle_debug = 0.0
+
+        if not self.is_done_state:
+            if abs(dist_err) < self.DIST_DEADBAND_ENTER:
+                self.is_done_state = True
 
         angle_err_deg = 0.0
-        side_indicator = ""
 
         if is_virtual:
             v_tan = 0.0
-            mode_tag = "FAR_APP"
         else:
             theta_leader = math.atan2(yl - yt, xl - xt)
-            diff_rad = math.radians(FORMATION_ANGLE_DIFF)
-            target_pos = theta_leader + diff_rad 
-            target_neg = theta_leader - diff_rad 
+            diff_rad = math.radians(self.FORMATION_ANGLE_DIFF)
+            target_pos = theta_leader + diff_rad
+            target_neg = theta_leader - diff_rad
 
             err_pos = wrap_rad_pi(target_pos - theta_robot)
             err_neg = wrap_rad_pi(target_neg - theta_robot)
 
-            if abs(err_pos) < abs(err_neg):
+            # 迟滞代价计算
+            cost_pos = abs(err_pos)
+            cost_neg = abs(err_neg)
+            if self.latest_side_intent == "+": cost_pos -= self.SIDE_HYSTERESIS_BIAS
+            elif self.latest_side_intent == "-": cost_neg -= self.SIDE_HYSTERESIS_BIAS
+
+            if cost_pos < cost_neg:
                 final_err_rad = err_pos
-                side_indicator = "+" # 正向/左
+                self.latest_side_intent = "+"
             else:
                 final_err_rad = err_neg
-                side_indicator = "-" # 负向/右
+                self.latest_side_intent = "-"
 
             angle_err_deg = math.degrees(final_err_rad)
-            
+            angle_debug = angle_err_deg
+
             if self.is_done_state and abs(angle_err_deg) < 5.0:
                  v_tan = 0.0
             else:
-                 v_tan = KP_THETA * final_err_rad * curr_dist
-                 v_tan = max(-0.3, min(0.3, v_tan))
-            
-            if not self.is_done_state: mode_tag = f"LOCK{side_indicator}"
+                 v_tan = max(-0.25, min(0.25, self.KP_THETA * final_err_rad * curr_dist))
 
         v_rad = 0.0
         if self.is_done_state:
             v_rad = 0.0
-            v_tan = 0.0
-            if not is_virtual: mode_tag = "DONE_L"
         else:
-            if abs_err < DIST_SOFT_ZONE:
-                v_rad = -KP_DIST_SLOW * dist_err
-                v_rad += math.copysign(FRICTION_FEEDFORWARD, v_rad)
-                if not is_virtual: mode_tag = f"SOFT{side_indicator}"
+            if abs(dist_err) < self.DIST_SOFT_ZONE:
+                v_rad = -self.KP_DIST_SLOW * dist_err
+                v_rad += math.copysign(self.FRICTION_FEEDFORWARD, v_rad)
             else:
-                v_rad = -KP_DIST_FAST * dist_err
-                if not is_virtual: mode_tag = f"FAST{side_indicator}"
+                v_rad = -self.KP_DIST_FAST * dist_err
 
-        # === [修改] 堵转检测与触发 ===
         check_effort = abs(v_rad) if v_rad < 0 else 0.0
         is_stalled, real_vel = self.stall_detector.update(xt, yt, check_effort)
-        
+
         if is_stalled and v_rad < 0:
-            # 触发脱困
-            self.unstuck_mode = True
-            self.unstuck_start_time = time.time()
-            
-            # 智能选择方向：顺着想去的方向滑
-            # side_indicator == "+" 意味着目标在左边 (+120)，所以往左平移
-            if side_indicator == "+": 
-                self.unstuck_direction = 1.0  # 向左
-            elif side_indicator == "-": 
-                self.unstuck_direction = -1.0 # 向右
-            else:
-                self.unstuck_direction = 1.0  # 默认向左
-            
-            mode_tag = "STALL"
-            print(f"🛑 检测到堵转！启动平移脱困 (方向: {self.unstuck_direction})")
-            return # 结束本帧，下一帧进入上面的 unstuck logic
+            v_rad = 0.0
+            self.mode_tag = "STALL"
 
-        v_rad = max(-0.25, min(0.25, v_rad))
+        v_rad = max(-0.15, min(0.15, v_rad))
 
-        # 速度合成
         th = theta_robot
         vx = v_rad * math.cos(th) - v_tan * math.sin(th)
         vy = v_rad * math.sin(th) + v_tan * math.cos(th)
 
-        if curr_dist < 0.18:
-            esc_x = 0.15 * math.cos(theta_robot)
-            esc_y = 0.15 * math.sin(theta_robot)
-            self.driver.send_velocity_command(esc_x, esc_y, 0.0)
-            print(f"⚠️ 穿模保护: {curr_dist:.2f}m")
-        else:
-            self.driver.send_velocity_command(vx, vy, 0.0)
-            print(f"[{mode_tag:7}] D:{curr_dist:.2f} | D_Err:{dist_err:.3f} | A_Err:{angle_err_deg:.1f}°")
+        # 更新调试数据
+        self.last_debug_err = (dist_err, angle_debug)
 
-    def _publish_debug(self, pb, pl):
-        msg = {
-            "ts": time.time(),
-            "ball": {"x": pb[0], "y": pb[1]},
-            "leader": {"x": pl[0], "y": pl[1]}
-        }
+        # 判断 Tracking 阶段是否结束
+        is_tracking_finished = False
+        if self.is_done_state and vx == 0.0 and vy == 0.0:
+            is_tracking_finished = True
+
+        return vx, vy, is_tracking_finished
+
+    def _select_best(self, batch, cls_id, pattern=None):
+        cands = [m for m in batch if m.get('class_id') == cls_id]
+        if pattern: cands = [m for m in cands if m.get('pattern') == pattern]
+        if not cands: return None
+        cands.sort(key=lambda m: (m.get('truncated', False), -m.get('conf', 0), -m.get('area', 0)))
+        return cands[0]
+
+class EventWatcher:
+    """光通信监测器"""
+    def __init__(self):
+        self.hist = defaultdict(lambda: deque(maxlen=40))
+
+    def ingest(self, batch):
+        t = mono()
+        for msg in batch:
+            cid = int(msg.get("class_id", -1))
+            pat = str(msg.get("pattern", "OFF"))
+            self.hist[cid].append((t, pat))
+
+    def stable_pattern(self, cid, pat, need_k, within_s):
+        h = self.hist[cid]
+        if not h: return False
+        t0 = mono() - within_s
+        cnt = sum(1 for (t, p) in h if t >= t0 and p == pat)
+        return cnt >= need_k
+
+# ================= 3. 主任务控制器 =================
+
+class SwarmMissionController:
+    """集群任务控制器"""
+    def __init__(self, robot_id):
+        self.ROBOT_ID = robot_id
+        print(f"🔧 初始化控制器 | Robot ID: {self.ROBOT_ID}")
+
+        self.BROKER_IP = "10.0.2.66"
+        self.DIST_FIND_BALL = 0.8
+        self.DIST_STOP_BALL = 0.32
+
+        self.state = "INIT"
+        self.my_role = "SEARCHER"
+        self.start_time = mono()
+        self.last_red_time = 0.0
+        self.red_detect_count = 0
+        self.FORCE_SEARCH_TIME = 3.0
+        self.t_armed_start = 0.0
+        self.t_run_start = 0.0
+
         try:
-            self.pub_sock.send_string(f"ekf_debug {json.dumps(msg)}")
-        except: pass
+            self.driver = RobotDriver(self.ROBOT_ID)
+            self.light = LightDriver(self.ROBOT_ID, broker_ip=self.BROKER_IP)
+        except Exception: pass
+
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.SUB)
+        self.socket.connect("tcp://localhost:5555")
+        self.socket.setsockopt_string(zmq.SUBSCRIBE, "perception")
+        self.socket.setsockopt(zmq.RCVTIMEO, 10)
+
+        # 这里使用了新的 Pilot
+        self.pilot = FormationPilot(self.driver if hasattr(self, 'driver') else None)
+        self.watcher = EventWatcher()
+        self.kf_ball = BodyFrameKF("LeaderBall") # 仅用于Searcher判断
+        self.update_state("SEARCH")
+
+    def update_state(self, new_state):
+        if self.state == new_state: return
+        print(f"🔄 [State] {self.my_role} | {self.state} -> {new_state}")
+        self.state = new_state
+        if hasattr(self, 'light'):
+            if new_state == "SEARCH":          self.light.set_cmd("SEARCH")
+            elif new_state == "APPROACH_BALL": self.light.set_cmd("APPROACH_BALL")
+            elif new_state == "LEADER_WAIT":   self.light.set_cmd("LEADER_WAIT")
+            elif new_state == "PREWARM":       self.light.set_cmd("LEADER_GO")
+            elif new_state == "ARMED":         self.light.set_cmd("FOLLOWER_PUSH")
+            elif new_state == "DONE":          self.light.set_cmd("OFF"); self.driver.stop()
+
+    def run(self):
+        print(f"🚀 任务启动 | ID: {self.ROBOT_ID}")
+        last_debug_log_t = mono()
+        while True:
+            try:
+                batch = []
+                latest_data = None
+                while True:
+                    try:
+                        msg = self.socket.recv_string(flags=zmq.NOBLOCK)
+                        _, json_str = msg.split(' ', 1)
+                        data = json.loads(json_str)
+                        if 'objects' in data: latest_data = data['objects']
+                        else: latest_data = [data]
+                    except zmq.Again: break
+                    except Exception: pass
+
+                if latest_data is not None: batch = latest_data
+                self.watcher.ingest(batch)
+
+                # [DEBUG] 日志
+                if mono() - last_debug_log_t > 1.0:
+                    seen_ids = sorted(list(set([m.get('class_id') for m in batch])))
+                    debug_msg = f"[DEBUG] State: {self.state:10s} | Role: {self.my_role:8s} | ID: {seen_ids}"
+                    if self.state == "BIDDING":
+                        p_ball = self.pilot.kf_ball.get_state()
+                        err_dist, err_ang = self.pilot.last_debug_err
+                        ball_str = f"({p_ball[0]:.2f}, {p_ball[1]:.2f})" if p_ball else "❌"
+                        debug_msg += f" | {self.pilot.mode_tag} | 🏀{ball_str} | Err:{err_dist:.2f}m"
+                    print(debug_msg)
+                    last_debug_log_t = mono()
+
+                # 更新全局KF (Searcher用)
+                raw_ball = next((m for m in batch if m['class_id'] == CLS_BALL), None)
+                if raw_ball: self.kf_ball.update(raw_ball['distance'], raw_ball.get('bearing_body', 0.0))
+                
+                kf_state = self.kf_ball.get_state()
+                has_ball = False
+                ball_dist = 999.0
+                ball_bearing = 0.0
+
+                if kf_state:
+                    ball_dist = math.hypot(kf_state[0], kf_state[1])
+                    ball_bearing = math.degrees(math.atan2(kf_state[1], kf_state[0]))
+                    has_ball = True
+                elif raw_ball:
+                    ball_dist = raw_ball.get('distance', 999.0)
+                    ball_bearing = normalize_angle(raw_ball.get('bearing_body', 0.0))
+                    has_ball = True
+
+                has_red = any(m['class_id'] == CLS_RED for m in batch)
+                now = mono()
+
+                if self.my_role == "SEARCHER":
+                    if has_ball and ball_dist < self.DIST_FIND_BALL:
+                        self.my_role = "LEADER"
+                        self.move_to_ball_simple(ball_dist, ball_bearing)
+                    elif has_red and (now - self.start_time > self.FORCE_SEARCH_TIME):
+                        if now - self.last_red_time < 0.3: self.red_detect_count += 1
+                        else: self.red_detect_count = 1
+                        self.last_red_time = now
+                        if self.red_detect_count >= 40:
+                            print("✅ 发现 Leader! 切换身份 -> FOLLOWER")
+                            self.my_role = "FOLLOWER"
+                            self.update_state("BIDDING")
+                    else:
+                        if now - self.last_red_time > 1.0: self.red_detect_count = 0
+                        self.update_state("SEARCH")
+                        self.omni_search_move()
+
+                elif self.my_role == "LEADER":
+                    if self.state == "APPROACH_BALL":
+                        if has_ball: self.move_to_ball_simple(ball_dist, ball_bearing)
+                        else: self.driver.stop()
+                    elif self.state == "LEADER_WAIT":
+                        left_ready = self.watcher.stable_pattern(CLS_GREEN, "SOLID", 3, 0.6)
+                        right_ready = self.watcher.stable_pattern(CLS_BLUE, "SOLID", 3, 0.6)
+                        if left_ready and right_ready:
+                            print("🎉 组队完成 -> PREWARM")
+                            self.update_state("PREWARM")
+                            self.t_armed_start = now + 2.0
+                        else: self.driver.stop()
+                    elif self.state == "PREWARM":
+                        if now > self.t_armed_start:
+                            self.update_state("ARMED")
+                            self.t_run_start = now + START_DELAY
+                    elif self.state == "ARMED":
+                        if now > self.t_run_start: self.update_state("RUN")
+                    elif self.state == "RUN":
+                        self.transport_move()
+
+                elif self.my_role == "FOLLOWER":
+                    if self.state == "BIDDING":
+                        # 调用新版 Pilot，内部处理 Tracking -> Sliding
+                        status = self.pilot.update(batch)
+                        
+                        # 根据意图设置灯光
+                        if self.pilot.latest_side_intent == "+": self.light.set_cmd("BID_LEFT")
+                        elif self.pilot.latest_side_intent == "-": self.light.set_cmd("BID_RIGHT")
+                        
+                        # 只有当 Pilot 彻底完成 (Finished) 并返回 LOCKED_XXX 时才跳转
+                        if status.startswith("LOCKED"):
+                            self.update_state("READY_WAIT")
+                            if "LEFT" in status: self.light.set_cmd("LOCK_LEFT")
+                            else: self.light.set_cmd("LOCK_RIGHT")
+                    
+                    elif self.state == "READY_WAIT":
+                        self.driver.stop()
+                        if self.watcher.stable_pattern(CLS_PURPLE, "SOLID", 3, 0.5):
+                            print("🚀 GO信号确认")
+                            self.update_state("ARMED")
+                            self.t_run_start = now + START_DELAY
+                    elif self.state == "ARMED":
+                        if now > self.t_run_start: self.update_state("RUN")
+                    elif self.state == "RUN":
+                        self.transport_move()
+
+                if self.state == "RUN" and (now - self.t_run_start > TRANSPORT_DURATION):
+                    self.update_state("DONE")
+                
+                time.sleep(0.03)
+
+            except KeyboardInterrupt: break
+            except Exception as e: print(f"Error: {e}")
+
+        if hasattr(self, 'light'): self.light.stop()
+        if hasattr(self, 'driver'): self.driver.stop()
+
+    def omni_search_move(self):
+        elapsed = mono() - self.start_time
+        vx, vy = 0.0, 0.0
+        if elapsed < 5.0:
+            if self.ROBOT_ID == 15:   vy = -0.2
+            elif self.ROBOT_ID == 13: vx = 0.2
+            elif self.ROBOT_ID == 10: vx = -0.2
+        else:
+            vy = -0.2
+            vx = 0.15 * math.sin(elapsed * math.pi)
+        if hasattr(self, 'driver'): self.driver.send_velocity_command(vx, vy, 0.0)
+
+    def move_to_ball_simple(self, dist, bearing):
+        dist_error = dist - self.DIST_STOP_BALL
+        if dist_error > 0:
+            self.update_state("APPROACH_BALL")
+            speed = max(0.0, min(0.2, dist_error * 0.6))
+            rad = math.radians(bearing)
+            if hasattr(self, 'driver'):
+                self.driver.send_velocity_command(speed*math.cos(rad), speed*math.sin(rad), 0.0)
+        else: self.update_state("LEADER_WAIT")
+
+    def transport_move(self):
+        if hasattr(self, 'driver'): self.driver.send_velocity_command(TRANSPORT_SPEED, 0.0, 0.0)
 
 if __name__ == "__main__":
-    try:
-        ctrl = FormationController()
-        ctrl.run()
-    except rospy.ROSInterruptException:
-        pass
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-i", "--id", type=int, required=True)
+    args = parser.parse_args()
+    c = SwarmMissionController(robot_id=args.id)
+    c.run()
